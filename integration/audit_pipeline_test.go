@@ -127,6 +127,9 @@ func assertStreamSafety(t *testing.T, natsURL string) {
 	if info.Config.MaxBytes != 8<<30 {
 		t.Fatalf("MaxBytes=%d want=%d", info.Config.MaxBytes, int64(8<<30))
 	}
+	if info.Config.MaxAge != 0 {
+		t.Fatalf("MaxAge=%s want=0", info.Config.MaxAge)
+	}
 	if info.Config.Discard != nats.DiscardNew {
 		t.Fatalf("Discard=%v want DiscardNew", info.Config.Discard)
 	}
