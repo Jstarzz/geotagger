@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: geotagger
+  namespace: geotagger
+spec:
+  type: ClusterIP
+  selector: {app: geotagger-api}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: geotagger-api
+  namespace: geotagger
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: geotagger-api}
+  template:
+    metadata:
+      labels: {app: geotagger-api}
+    spec:
+      initContainers:
+        - name: wait-for-mmdb
+          image: busybox:1.37.0
+          command: ["sh", "-c", "until [ -s /data/GeoLite2-Country.mmdb ]; do sleep 1; done"]
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: mmdb, mountPath: /data, readOnly: true}
+      containers:
+        - name: api
+          image: ghcr.io/jstarzz/geotagger-api:latest
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: admin, containerPort: 9090}
+          env:
+            - {name: MMDB_PATH, value: /data/GeoLite2-Country.mmdb}
+            - {name: NATS_URL, value: nats://nats:4222}
+            - {name: AUDIT_IP_MODE, value: hmac}
+            - name: API_KEYS
+              valueFrom: {secretKeyRef: {name: geotagger-secrets, key: API_KEYS}}
+            - name: AUDIT_HMAC_KEY
+              valueFrom: {secretKeyRef: {name: geotagger-secrets, key: AUDIT_HMAC_KEY}}
+          readinessProbe:
+            httpGet: {path: /readyz, port: admin}
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /healthz, port: admin}
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            requests: {cpu: 250m, memory: 64Mi}
+            limits: {cpu: "2", memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: mmdb, mountPath: /data, readOnly: true}
+      volumes:
+        - name: mmdb
+          hostPath:
+            path: /var/lib/geotagger/mmdb
+            type: DirectoryOrCreate
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: geotagger-api
+  namespace: geotagger
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: geotagger-api
+  minReplicas: 1
+  maxReplicas: 8
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - {type: Percent, value: 100, periodSeconds: 15}
+        - {type: Pods, value: 2, periodSeconds: 15}
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - {type: Percent, value: 50, periodSeconds: 60}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65

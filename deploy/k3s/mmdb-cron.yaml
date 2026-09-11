@@ -1,0 +1,30 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: geotagger-mmdb-update
+  namespace: geotagger
+spec:
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 3600
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: updater
+              image: ghcr.io/jstarzz/geotagger-updater:latest
+              env:
+                - {name: MMDB_PATH, value: /data/GeoLite2-Country.mmdb}
+                - name: MAXMIND_LICENSE_KEY
+                  valueFrom: {secretKeyRef: {name: geotagger-secrets, key: MAXMIND_LICENSE_KEY}}
+              volumeMounts:
+                - {name: mmdb, mountPath: /data}
+          volumes:
+            - name: mmdb
+              hostPath:
+                path: /var/lib/geotagger/mmdb
+                type: DirectoryOrCreate

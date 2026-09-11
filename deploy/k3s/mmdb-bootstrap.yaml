@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: geotagger-mmdb-bootstrap
+  namespace: geotagger
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: prepare-mmdb-volume
+          image: busybox:1.37.0
+          command: ["sh", "-c", "chown -R 65532:65532 /data && chmod 0750 /data"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"], add: ["CHOWN", "FOWNER"]}
+          volumeMounts:
+            - {name: mmdb, mountPath: /data}
+      containers:
+        - name: updater
+          image: ghcr.io/jstarzz/geotagger-updater:latest
+          env:
+            - {name: MMDB_PATH, value: /data/GeoLite2-Country.mmdb}
+            - name: MAXMIND_LICENSE_KEY
+              valueFrom: {secretKeyRef: {name: geotagger-secrets, key: MAXMIND_LICENSE_KEY}}
+          volumeMounts:
+            - {name: mmdb, mountPath: /data}
+      volumes:
+        - name: mmdb
+          hostPath:
+            path: /var/lib/geotagger/mmdb
+            type: DirectoryOrCreate

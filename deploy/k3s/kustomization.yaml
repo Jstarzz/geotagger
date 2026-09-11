@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - network-policy.yaml
+  - nats.yaml
+  - clickhouse.yaml
+  - api.yaml
+  - worker.yaml
+  - mmdb-cron.yaml
+  - cloudflared.yaml

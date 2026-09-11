@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-init
+  namespace: geotagger
+data:
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS geotagger;
+    CREATE TABLE IF NOT EXISTS geotagger.audit_events
+    (
+        timestamp DateTime64(6, 'UTC'),
+        request_id String,
+        caller_id LowCardinality(String),
+        ip_value String,
+        ip_mode LowCardinality(String),
+        country_code LowCardinality(String),
+        country String,
+        outcome LowCardinality(String),
+        status_code UInt16,
+        lookup_latency_us UInt64,
+        mmdb_version LowCardinality(String)
+    ) ENGINE = MergeTree
+    PARTITION BY toDate(timestamp)
+    ORDER BY (timestamp, caller_id, request_id)
+    TTL timestamp + INTERVAL 30 DAY DELETE;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: geotagger
+spec:
+  type: ClusterIP
+  selector: {app: clickhouse}
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: geotagger
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector:
+    matchLabels: {app: clickhouse}
+  template:
+    metadata:
+      labels: {app: clickhouse}
+    spec:
+      containers:
+        - name: clickhouse
+          # 26.3 LTS still targets the x86-64-v2/SSE4.2 baseline required by
+          # the on-prem Westmere host. ClickHouse 26.6+ default amd64 images
+          # require x86-64-v3/AVX2 and cannot run on this node.
+          image: clickhouse/clickhouse-server:26.3.33.24-alpine@sha256:67e3716310e54050a7164b1f535c81e59c397654b158aa50b488218cbdc77144
+          env:
+            - {name: CLICKHOUSE_DB, value: geotagger}
+            - {name: CLICKHOUSE_USER, value: geotagger_ingest}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: {secretKeyRef: {name: geotagger-secrets, key: CLICKHOUSE_PASSWORD}}
+          ports:
+            - {name: http, containerPort: 8123}
+          readinessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "4", memory: 4Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/clickhouse}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d/init.sql, subPath: init.sql, readOnly: true}
+      volumes:
+        - name: init
+          configMap: {name: clickhouse-init}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: {storage: 50Gi}

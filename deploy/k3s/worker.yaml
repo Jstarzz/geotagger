@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: geotagger-audit-worker
+  namespace: geotagger
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: geotagger-audit-worker}
+  template:
+    metadata:
+      labels: {app: geotagger-audit-worker}
+    spec:
+      containers:
+        - name: worker
+          image: ghcr.io/jstarzz/geotagger-worker:latest
+          env:
+            - {name: NATS_URL, value: nats://nats:4222}
+            - {name: CLICKHOUSE_URL, value: http://clickhouse:8123}
+            - {name: CLICKHOUSE_USER, value: geotagger_ingest}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: {secretKeyRef: {name: geotagger-secrets, key: CLICKHOUSE_PASSWORD}}
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: "1", memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities: {drop: ["ALL"]}
