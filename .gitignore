@@ -1,0 +1,6 @@
+.env
+*.mmdb
+*.tar.gz
+bin/
+coverage.out
+.DS_Store

@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-init
+  namespace: geotagger
+data:
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS geotagger;
+    CREATE TABLE IF NOT EXISTS geotagger.audit_events
+    (
+        timestamp DateTime64(6, 'UTC'),
+        request_id String,
+        caller_id LowCardinality(String),
+        ip_value String,
+        ip_mode LowCardinality(String),
+        country_code LowCardinality(String),
+        country String,
+        outcome LowCardinality(String),
+        status_code UInt16,
+        lookup_latency_us UInt64,
+        mmdb_version LowCardinality(String)
+    ) ENGINE = MergeTree
+    PARTITION BY toDate(timestamp)
+    ORDER BY (timestamp, caller_id, request_id)
+    TTL timestamp + INTERVAL 30 DAY DELETE;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: geotagger
+spec:
+  selector: {app: clickhouse}
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: geotagger
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector:
+    matchLabels: {app: clickhouse}
+  template:
+    metadata:
+      labels: {app: clickhouse}
+    spec:
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:26.8-alpine
+          env:
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: {secretKeyRef: {name: geotagger-secrets, key: CLICKHOUSE_PASSWORD}}
+          ports:
+            - containerPort: 8123
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/clickhouse}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d/init.sql, subPath: init.sql, readOnly: true}
+      volumes:
+        - name: init
+          configMap: {name: clickhouse-init}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests: {storage: 50Gi}
