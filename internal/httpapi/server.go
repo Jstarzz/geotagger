@@ -17,6 +17,8 @@ import (
 	"github.com/Jstarzz/geotagger/internal/geo"
 )
 
+type requestIDContextKey struct{}
+
 type Server struct {
 	lookup          geo.Lookup
 	auth            *auth.Verifier
@@ -71,9 +73,13 @@ func (s *Server) requestMiddleware(next http.Handler) http.Handler {
 		s.metrics.requests.Add(1)
 		s.metrics.inflight.Add(1)
 		defer s.metrics.inflight.Add(-1)
+
+		id := requestID()
+		w.Header().Set("X-Request-ID", id)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), requestIDContextKey{}, id)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -81,6 +87,9 @@ func (s *Server) country(w http.ResponseWriter, r *http.Request) {
 	caller, err := s.auth.VerifyAuthorization(r.Header.Get("Authorization"))
 	if err != nil {
 		s.metrics.authFailures.Add(1)
+		// Authentication failures are security-significant. Audit them best-effort,
+		// but never turn the correct 401 response into an audit-transport error.
+		s.publishFailureAudit(r.Context(), "unauthenticated", netip.Addr{}, "unauthorized", http.StatusUnauthorized, 0)
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -88,10 +97,12 @@ func (s *Server) country(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, s.maxBodyBytes+1))
 	if err != nil {
+		s.publishFailureAudit(r.Context(), caller, netip.Addr{}, "invalid_request", http.StatusBadRequest, 0)
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if int64(len(body)) > s.maxBodyBytes {
+		s.publishFailureAudit(r.Context(), caller, netip.Addr{}, "request_too_large", http.StatusRequestEntityTooLarge, 0)
 		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
 	}
@@ -161,7 +172,7 @@ func (s *Server) publishAudit(parent context.Context, caller string, ip netip.Ad
 	ctx, cancel := context.WithTimeout(parent, s.auditTimeout)
 	defer cancel()
 	event := audit.Event{
-		Timestamp: time.Now().UTC(), RequestID: requestID(), CallerID: caller,
+		Timestamp: time.Now().UTC(), RequestID: requestIDFromContext(parent), CallerID: caller,
 		IPMode: s.auditIPMode, CountryCode: result.CountryCode, Country: result.Country,
 		Outcome: outcome, StatusCode: uint16(status), LookupLatencyUS: latencyUS, MMDBVersion: s.lookup.Version(),
 	}
@@ -177,6 +188,13 @@ func (s *Server) publishAudit(parent context.Context, caller string, ip netip.Ad
 
 func publicTarget(ip netip.Addr) bool {
 	return ip.IsValid() && ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+}
+
+func requestIDFromContext(ctx context.Context) string {
+	if id, ok := ctx.Value(requestIDContextKey{}).(string); ok && id != "" {
+		return id
+	}
+	return requestID()
 }
 
 func requestID() string {
