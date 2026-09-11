@@ -36,8 +36,8 @@ func TestAuditPipeline(t *testing.T) {
 	}
 
 	waitForClickHouse(t, clickhouseURL, clickhouseUser, clickhousePassword)
+	execClickHouse(t, clickhouseURL, clickhouseUser, clickhousePassword, "CREATE DATABASE IF NOT EXISTS geotagger")
 	execClickHouse(t, clickhouseURL, clickhouseUser, clickhousePassword, `
-		CREATE DATABASE IF NOT EXISTS geotagger;
 		CREATE TABLE IF NOT EXISTS geotagger.audit_events
 		(
 			timestamp DateTime64(6, 'UTC'), request_id String, caller_id LowCardinality(String),
