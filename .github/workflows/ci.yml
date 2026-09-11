@@ -27,6 +27,15 @@ jobs:
       - name: Check reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
+  validate-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Render K3s manifests
+        run: kubectl kustomize deploy/k3s > /tmp/geotagger-manifests.yaml
+      - name: Verify pinned ClickHouse LTS image exists and starts
+        run: docker run --rm --entrypoint clickhouse clickhouse/clickhouse-server:26.3.33.24-alpine --version
+
   build-images:
     runs-on: ubuntu-latest
     strategy:
