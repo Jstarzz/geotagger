@@ -23,6 +23,16 @@ spec:
       labels: {app: geotagger-api}
     spec:
       initContainers:
+        - name: prepare-mmdb-volume
+          image: busybox:1.37.0
+          command: ["sh", "-c", "chown -R 65532:65532 /data && chmod 0750 /data"]
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"], add: ["CHOWN", "FOWNER"]}
+          volumeMounts:
+            - {name: mmdb, mountPath: /data}
         - name: seed-mmdb
           image: ghcr.io/jstarzz/geotagger-updater:latest
           env:
