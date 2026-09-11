@@ -45,7 +45,8 @@ func New(cfg Config) (*Worker, error) {
 		default:
 			_ = msg.Nak()
 		}
-	}, nats.Durable(cfg.Durable), nats.ManualAck(), nats.AckExplicit(), nats.BindStream(cfg.Stream), nats.MaxAckPending(cfg.BatchSize*8))
+	}, nats.Durable(cfg.Durable), nats.ManualAck(), nats.AckExplicit(), nats.AckWait(60*time.Second),
+		nats.BindStream(cfg.Stream), nats.MaxAckPending(cfg.BatchSize*8))
 	if err != nil {
 		nc.Close()
 		return nil, fmt.Errorf("subscribe: %w", err)
