@@ -23,24 +23,16 @@ spec:
       labels: {app: geotagger-api}
     spec:
       initContainers:
-        - name: prepare-mmdb-volume
+        - name: wait-for-mmdb
           image: busybox:1.37.0
-          command: ["sh", "-c", "chown -R 65532:65532 /data && chmod 0750 /data"]
+          command: ["sh", "-c", "until [ -s /data/GeoLite2-Country.mmdb ]; do sleep 1; done"]
           securityContext:
-            runAsUser: 0
-            runAsGroup: 0
+            runAsUser: 65532
+            runAsGroup: 65532
             allowPrivilegeEscalation: false
-            capabilities: {drop: ["ALL"], add: ["CHOWN", "FOWNER"]}
+            capabilities: {drop: ["ALL"]}
           volumeMounts:
-            - {name: mmdb, mountPath: /data}
-        - name: seed-mmdb
-          image: ghcr.io/jstarzz/geotagger-updater:latest
-          env:
-            - {name: MMDB_PATH, value: /data/GeoLite2-Country.mmdb}
-            - name: MAXMIND_LICENSE_KEY
-              valueFrom: {secretKeyRef: {name: geotagger-secrets, key: MAXMIND_LICENSE_KEY}}
-          volumeMounts:
-            - {name: mmdb, mountPath: /data}
+            - {name: mmdb, mountPath: /data, readOnly: true}
       containers:
         - name: api
           image: ghcr.io/jstarzz/geotagger-api:latest
