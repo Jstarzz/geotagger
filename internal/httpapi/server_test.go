@@ -67,15 +67,34 @@ func TestCountry(t *testing.T) {
 	if len(a.events) != 1 || a.events[0].IPValue == "8.8.8.8" {
 		t.Fatalf("audit IP was not HMAC protected: %#v", a.events)
 	}
+	requestID := rr.Header().Get("X-Request-ID")
+	if requestID == "" {
+		t.Fatal("missing X-Request-ID")
+	}
+	if a.events[0].RequestID != requestID {
+		t.Fatalf("audit request_id=%q response request_id=%q", a.events[0].RequestID, requestID)
+	}
 }
 
-func TestCountryRejectsUnauthorized(t *testing.T) {
-	s, _ := testServer(t)
+func TestCountryRejectsUnauthorizedAndAudits(t *testing.T) {
+	s, a := testServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/v1/country", strings.NewReader(`{"ip":"8.8.8.8"}`))
 	rr := httptest.NewRecorder()
 	s.APIHandler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d", rr.Code)
+	}
+	if len(a.events) != 1 {
+		t.Fatalf("events=%d", len(a.events))
+	}
+	if a.events[0].CallerID != "unauthenticated" || a.events[0].Outcome != "unauthorized" {
+		t.Fatalf("unexpected audit event: %#v", a.events[0])
+	}
+	if a.events[0].IPValue != "" {
+		t.Fatalf("unauthorized request should not parse/store target IP: %#v", a.events[0])
+	}
+	if a.events[0].RequestID != rr.Header().Get("X-Request-ID") {
+		t.Fatalf("audit request ID mismatch: %#v", a.events[0])
 	}
 }
 
