@@ -4,10 +4,10 @@ metadata:
   name: geotagger
   namespace: geotagger
 spec:
+  type: ClusterIP
   selector: {app: geotagger-api}
   ports:
     - {name: http, port: 8080, targetPort: 8080}
-    - {name: admin, port: 9090, targetPort: 9090}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -50,9 +50,13 @@ spec:
           readinessProbe:
             httpGet: {path: /readyz, port: admin}
             periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
           livenessProbe:
             httpGet: {path: /healthz, port: admin}
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
           resources:
             requests: {cpu: 250m, memory: 64Mi}
             limits: {cpu: "2", memory: 256Mi}
