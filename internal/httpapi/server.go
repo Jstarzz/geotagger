@@ -138,8 +138,7 @@ func (s *Server) country(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	result, found, err := s.lookup.Lookup(ip)
 	latencyUS := uint64(time.Since(started).Microseconds())
-	s.metrics.lookupUS.Add(latencyUS)
-	s.metrics.lookupCount.Add(1)
+	s.metrics.ObserveLookup(latencyUS)
 	if err != nil {
 		s.metrics.lookupFailures.Add(1)
 		if !s.publishAudit(r.Context(), caller, ip, geo.Result{}, "lookup_error", http.StatusInternalServerError, latencyUS) {
