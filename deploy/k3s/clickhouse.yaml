@@ -56,7 +56,7 @@ spec:
           # 26.3 LTS still targets the x86-64-v2/SSE4.2 baseline required by
           # the on-prem Westmere host. ClickHouse 26.6+ default amd64 images
           # require x86-64-v3/AVX2 and cannot run on this node.
-          image: clickhouse/clickhouse-server:26.3.33.24-alpine
+          image: clickhouse/clickhouse-server:26.3.33.24-alpine@sha256:67e3716310e54050a7164b1f535c81e59c397654b158aa50b488218cbdc77144
           env:
             - {name: CLICKHOUSE_DB, value: geotagger}
             - {name: CLICKHOUSE_USER, value: geotagger_ingest}
