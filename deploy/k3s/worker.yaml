@@ -17,7 +17,7 @@ spec:
           env:
             - {name: NATS_URL, value: nats://nats:4222}
             - {name: CLICKHOUSE_URL, value: http://clickhouse:8123}
-            - {name: CLICKHOUSE_USER, value: default}
+            - {name: CLICKHOUSE_USER, value: geotagger_ingest}
             - name: CLICKHOUSE_PASSWORD
               valueFrom: {secretKeyRef: {name: geotagger-secrets, key: CLICKHOUSE_PASSWORD}}
           resources:
