@@ -11,6 +11,8 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+const auditStreamMaxBytes int64 = 8 << 30 // leave headroom on the 10 GiB JetStream PVC
+
 type NATSPublisher struct {
 	nc      *nats.Conn
 	js      nats.JetStreamContext
@@ -32,26 +34,60 @@ func NewNATSPublisher(url, stream, subject string) (*NATSPublisher, error) {
 		nc.Close()
 		return nil, fmt.Errorf("jetstream: %w", err)
 	}
-	if _, err := js.StreamInfo(stream); err != nil {
+	if err := ensureAuditStream(js, stream, subject); err != nil {
+		nc.Close()
+		return nil, err
+	}
+	return &NATSPublisher{nc: nc, js: js, subject: subject}, nil
+}
+
+func ensureAuditStream(js nats.JetStreamContext, stream, subject string) error {
+	info, err := js.StreamInfo(stream)
+	if err != nil {
 		if err != nats.ErrStreamNotFound {
-			nc.Close()
-			return nil, fmt.Errorf("stream info: %w", err)
+			return fmt.Errorf("stream info: %w", err)
 		}
-		if _, err := js.AddStream(&nats.StreamConfig{
+		_, err = js.AddStream(&nats.StreamConfig{
 			Name:      stream,
 			Subjects:  []string{subject},
 			Storage:   nats.FileStorage,
 			Retention: nats.WorkQueuePolicy,
 			MaxAge:    7 * 24 * time.Hour,
-		}); err != nil {
-			// Multiple API pods can race to provision the stream on first boot.
-			if _, checkErr := js.StreamInfo(stream); checkErr != nil {
-				nc.Close()
-				return nil, fmt.Errorf("create stream: %w", err)
-			}
+			MaxBytes:  auditStreamMaxBytes,
+			Discard:   nats.DiscardNew,
+		})
+		if err == nil {
+			return nil
+		}
+		// Multiple API pods can race to provision the stream on first boot.
+		info, err = js.StreamInfo(stream)
+		if err != nil {
+			return fmt.Errorf("create stream: %w", err)
 		}
 	}
-	return &NATSPublisher{nc: nc, js: js, subject: subject}, nil
+
+	// Reconcile the mutable safety settings on startup so an existing stream
+	// cannot silently retain an old unbounded configuration after an upgrade.
+	cfg := info.Config
+	changed := false
+	if cfg.MaxAge != 7*24*time.Hour {
+		cfg.MaxAge = 7 * 24 * time.Hour
+		changed = true
+	}
+	if cfg.MaxBytes != auditStreamMaxBytes {
+		cfg.MaxBytes = auditStreamMaxBytes
+		changed = true
+	}
+	if cfg.Discard != nats.DiscardNew {
+		cfg.Discard = nats.DiscardNew
+		changed = true
+	}
+	if changed {
+		if _, err := js.UpdateStream(&cfg); err != nil {
+			return fmt.Errorf("update audit stream safety limits: %w", err)
+		}
+	}
+	return nil
 }
 
 func (p *NATSPublisher) Publish(ctx context.Context, event audit.Event) error {
