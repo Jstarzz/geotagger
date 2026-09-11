@@ -27,6 +27,41 @@ jobs:
       - name: Check reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
+  integration-audit:
+    runs-on: ubuntu-latest
+    env:
+      INTEGRATION_CLICKHOUSE_PASSWORD: geotagger-integration-password-0123456789
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Start NATS and ClickHouse
+        run: |
+          docker run -d --name geotagger-nats -p 4222:4222 nats:2.14.6-alpine -js -sd /data
+          docker run -d --name geotagger-clickhouse -p 8123:8123 \
+            -e CLICKHOUSE_DB=geotagger \
+            -e CLICKHOUSE_USER=geotagger_ingest \
+            -e CLICKHOUSE_PASSWORD="$INTEGRATION_CLICKHOUSE_PASSWORD" \
+            clickhouse/clickhouse-server:26.3.33.24-alpine@sha256:67e3716310e54050a7164b1f535c81e59c397654b158aa50b488218cbdc77144
+      - name: Wait for NATS
+        shell: bash
+        run: |
+          for i in {1..40}; do
+            if (echo > /dev/tcp/127.0.0.1/4222) >/dev/null 2>&1; then exit 0; fi
+            sleep 0.25
+          done
+          docker logs geotagger-nats
+          exit 1
+      - name: Test durable audit pipeline
+        run: go test -tags=integration ./integration -count=1 -v
+      - name: Service logs on failure
+        if: failure()
+        run: |
+          docker logs geotagger-nats || true
+          docker logs geotagger-clickhouse || true
+
   validate-deploy:
     runs-on: ubuntu-latest
     steps:
@@ -34,7 +69,7 @@ jobs:
       - name: Render K3s manifests
         run: kubectl kustomize deploy/k3s > /tmp/geotagger-manifests.yaml
       - name: Verify pinned ClickHouse LTS image exists and starts
-        run: docker run --rm --entrypoint clickhouse clickhouse/clickhouse-server:26.3.33.24-alpine --version
+        run: docker run --rm --entrypoint clickhouse clickhouse/clickhouse-server:26.3.33.24-alpine@sha256:67e3716310e54050a7164b1f535c81e59c397654b158aa50b488218cbdc77144 --version
 
   build-images:
     runs-on: ubuntu-latest
