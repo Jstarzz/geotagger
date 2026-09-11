@@ -52,7 +52,6 @@ func ensureAuditStream(js nats.JetStreamContext, stream, subject string) error {
 			Subjects:  []string{subject},
 			Storage:   nats.FileStorage,
 			Retention: nats.WorkQueuePolicy,
-			MaxAge:    7 * 24 * time.Hour,
 			MaxBytes:  auditStreamMaxBytes,
 			Discard:   nats.DiscardNew,
 		})
@@ -66,12 +65,13 @@ func ensureAuditStream(js nats.JetStreamContext, stream, subject string) error {
 		}
 	}
 
-	// Reconcile the mutable safety settings on startup so an existing stream
-	// cannot silently retain an old unbounded configuration after an upgrade.
+	// Reconcile the mutable safety settings on startup. Unacknowledged audit
+	// events must never disappear solely because they are old: capacity pressure
+	// is handled fail-closed with MaxBytes + DiscardNew instead.
 	cfg := info.Config
 	changed := false
-	if cfg.MaxAge != 7*24*time.Hour {
-		cfg.MaxAge = 7 * 24 * time.Hour
+	if cfg.MaxAge != 0 {
+		cfg.MaxAge = 0
 		changed = true
 	}
 	if cfg.MaxBytes != auditStreamMaxBytes {
