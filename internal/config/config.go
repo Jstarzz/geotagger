@@ -75,8 +75,14 @@ func LoadAPI() (API, error) {
 	if c.AuditIPMode != "hmac" && c.AuditIPMode != "raw" && c.AuditIPMode != "omit" {
 		return API{}, fmt.Errorf("AUDIT_IP_MODE must be hmac, raw, or omit")
 	}
-	if c.AuditIPMode == "hmac" && c.AuditHMACKey == "" {
-		return API{}, errors.New("AUDIT_HMAC_KEY is required when AUDIT_IP_MODE=hmac")
+	if c.AuditIPMode == "hmac" && len(c.AuditHMACKey) < 32 {
+		return API{}, errors.New("AUDIT_HMAC_KEY must be at least 32 bytes when AUDIT_IP_MODE=hmac")
+	}
+	if c.MaxBodyBytes < 1 {
+		return API{}, errors.New("MAX_BODY_BYTES must be positive")
+	}
+	if c.AuditTimeout <= 0 {
+		return API{}, errors.New("AUDIT_TIMEOUT must be positive")
 	}
 	return c, nil
 }
@@ -88,7 +94,7 @@ func LoadWorker() (Worker, error) {
 		AuditSubject:       getenv("AUDIT_SUBJECT", "geotagger.audit.lookup"),
 		DurableName:        getenv("AUDIT_DURABLE", "geotagger-clickhouse"),
 		ClickHouseURL:      getenv("CLICKHOUSE_URL", "http://clickhouse:8123"),
-		ClickHouseUser:     getenv("CLICKHOUSE_USER", "default"),
+		ClickHouseUser:     getenv("CLICKHOUSE_USER", "geotagger_ingest"),
 		ClickHousePassword: os.Getenv("CLICKHOUSE_PASSWORD"),
 		BatchSize:          1000,
 	}
@@ -104,6 +110,12 @@ func LoadWorker() (Worker, error) {
 	}
 	if c.BatchSize < 1 {
 		return Worker{}, errors.New("BATCH_SIZE must be positive")
+	}
+	if c.ClickHouseUser == "" {
+		return Worker{}, errors.New("CLICKHOUSE_USER is required")
+	}
+	if c.ClickHousePassword == "" {
+		return Worker{}, errors.New("CLICKHOUSE_PASSWORD is required")
 	}
 	return c, nil
 }
