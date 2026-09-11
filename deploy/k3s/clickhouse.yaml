@@ -30,6 +30,7 @@ metadata:
   name: clickhouse
   namespace: geotagger
 spec:
+  type: ClusterIP
   selector: {app: clickhouse}
   ports:
     - name: http
@@ -52,15 +53,32 @@ spec:
     spec:
       containers:
         - name: clickhouse
-          image: clickhouse/clickhouse-server:26.8-alpine
+          # The on-prem Westmere host is pre-AVX2. This image keeps the official
+          # 26.8 server filesystem/entrypoint but replaces the binary with the
+          # official ClickHouse amd64compat build.
+          image: ghcr.io/jstarzz/geotagger-clickhouse-compat:26.8.2.7
           env:
+            - {name: CLICKHOUSE_DB, value: geotagger}
+            - {name: CLICKHOUSE_USER, value: geotagger_ingest}
             - name: CLICKHOUSE_PASSWORD
               valueFrom: {secretKeyRef: {name: geotagger-secrets, key: CLICKHOUSE_PASSWORD}}
           ports:
-            - containerPort: 8123
+            - {name: http, containerPort: 8123}
+          readinessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
           resources:
             requests: {cpu: 250m, memory: 512Mi}
-            limits: {cpu: "2", memory: 2Gi}
+            limits: {cpu: "4", memory: 4Gi}
           volumeMounts:
             - {name: data, mountPath: /var/lib/clickhouse}
             - {name: init, mountPath: /docker-entrypoint-initdb.d/init.sql, subPath: init.sql, readOnly: true}
