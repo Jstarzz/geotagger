@@ -53,10 +53,10 @@ spec:
     spec:
       containers:
         - name: clickhouse
-          # The on-prem Westmere host is pre-AVX2. This image keeps the official
-          # 26.8 server filesystem/entrypoint but replaces the binary with the
-          # official ClickHouse amd64compat build.
-          image: ghcr.io/jstarzz/geotagger-clickhouse-compat:26.8.2.7
+          # 26.3 LTS still targets the x86-64-v2/SSE4.2 baseline required by
+          # the on-prem Westmere host. ClickHouse 26.6+ default amd64 images
+          # require x86-64-v3/AVX2 and cannot run on this node.
+          image: clickhouse/clickhouse-server:26.3.33.24-alpine
           env:
             - {name: CLICKHOUSE_DB, value: geotagger}
             - {name: CLICKHOUSE_USER, value: geotagger_ingest}
