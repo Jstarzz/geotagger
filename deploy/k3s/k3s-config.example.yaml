@@ -1,0 +1,5 @@
+# Recommended K3s server configuration for a fresh geotagger node.
+# Merge with any existing /etc/rancher/k3s/config.yaml; do not overwrite
+# unrelated cluster settings.
+secrets-encryption: true
+secrets-encryption-provider: secretbox
