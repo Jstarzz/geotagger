@@ -1,238 +1,294 @@
 # GeoTagger Internal Security Audit
 
-## Scope and status
+## Scope
 
-This is an internal engineering security review of the GeoTagger repository and the deployed single-node K3s architecture. It is not a third-party penetration test, legal opinion, HIPAA certification, or substitute for organizational risk analysis.
+This is a repository and architecture review of the current GeoTagger implementation and single-node K3s deployment. It is not a penetration test, legal opinion, HIPAA certification, or substitute for the regulated entity's risk analysis.
 
-Reviewed areas include:
+Reviewed areas:
 
 - API authentication and request validation;
-- audit/privacy handling;
+- audit privacy and durability;
 - Kubernetes workload security;
-- network exposure and NetworkPolicy;
-- secret handling;
-- ClickHouse/NATS deployment;
-- Cloudflare Tunnel ingress; and
-- operational availability/capacity risks.
+- service/network exposure;
+- secrets and credential handling;
+- NATS/ClickHouse deployment;
+- Cloudflare Tunnel ingress;
+- availability/recovery design; and
+- readiness for use in a regulated healthcare workflow.
 
-## Executive summary
+## Summary
 
-The deployed design has a strong baseline for a small self-hosted machine API: no direct inbound origin exposure, bearer credentials stored as digests, bounded request parsing, private-address filtering, HMAC-based IP audit privacy, durable fail-closed audit publication, default-deny ingress, internal-only data services, non-root/read-only application containers, and encrypted Kubernetes Secrets when the recommended K3s configuration is used.
+No critical authentication-bypass or remote-code-execution issue was identified in this repository-level review. The current machine API has several useful controls: per-caller secrets stored as digests, strict input handling, public-address filtering, HMAC-based IP audit storage, durable JetStream acceptance, internal-only stateful services, non-root application containers and default-deny ingress.
 
-No critical code-execution or authentication-bypass issue was identified in this review.
+The main production gaps are operational rather than lookup-algorithm problems:
 
-The most important remaining work is operational hardening rather than rewriting the lookup service: formal credential lifecycle, egress policy, immutable image pinning, stronger ClickHouse least privilege, multi-node/backup planning if availability requirements increase, and completion of the required compliance/vendor controls if regulated data is introduced.
+1. pod egress is not default-deny;
+2. API-token lifecycle is external/manual;
+3. some runtime images remain tag-pinned instead of digest-pinned;
+4. ClickHouse SQL privileges should be narrowed further;
+5. backups/restore evidence are not yet part of the deployed control set;
+6. the entire service remains on one VM/host failure domain;
+7. privileged-human MFA/access governance must be enforced outside the API; and
+8. HIPAA/BAA/risk-management controls must be completed before ePHI use.
 
-## Existing controls
+## Current controls
 
-### Authentication
+### Machine authentication
 
-Caller credentials use:
+Caller token format:
 
 ```text
 key-id.secret
 ```
 
-The server stores only the SHA-256 digest of each secret. Verification uses constant-time comparison. Unknown key IDs still perform comparable hashing work before rejection.
+The server stores the SHA-256 digest of the secret and uses constant-time comparison. Unknown key IDs still execute comparable hashing work before rejection.
 
-The key generator creates 32 bytes of cryptographically random secret material and emits a URL-safe token plus its server-side digest entry.
+The key generator uses cryptographically secure random material.
 
-Assessment: **Good**.
+Risk remaining: key expiry, owner, rotation date, revocation workflow and last-use metadata are not modeled in the application. Maintain those in an operational credential inventory or dedicated secret/identity system.
 
 ### Request validation
 
 The API:
 
-- limits request-body size;
+- limits body size;
 - rejects unknown JSON fields;
-- requires a single JSON object;
+- rejects multiple JSON values;
 - validates IP syntax;
 - normalizes IPv4-mapped addresses; and
-- rejects private, loopback, and link-local targets unless explicitly configured otherwise.
-
-Assessment: **Good**.
+- rejects private, loopback and link-local targets unless explicitly configured otherwise.
 
 ### Audit privacy
 
-Default mode stores HMAC-SHA256 of the queried IP instead of the raw address. Authentication failures are audited without retaining the requested target IP. Request IDs allow event correlation without placing the IP into ordinary access logs.
+Default mode stores HMAC-SHA256 of the target IP. Raw target IP is not retained in the default audit record. Authentication failures are audited without storing the requested target IP.
 
-Assessment: **Good**.
+HMAC values remain sensitive because they are stable/correlatable under one key. Protect the HMAC key separately from the ClickHouse dataset.
 
 ### Audit durability
 
-Successful/normal lookup paths require a durable NATS JetStream publish acknowledgement before returning. The production stream configuration uses:
+Normal lookup success depends on a durable JetStream publish ACK.
+
+Stream safety settings:
 
 ```text
-WorkQueue retention
-MaxAge = 0
-MaxBytes = 8 GiB
-DiscardNew
+Retention: WorkQueue
+MaxAge:    0
+MaxBytes:  8 GiB
+Discard:   DiscardNew
 ```
 
-This prevents old, unpersisted audit records from disappearing solely because of age. When capacity is exhausted, the system fails closed rather than silently dropping the oldest required audit data.
-
-Assessment: **Strong** for a single-node design.
+This prevents required unpersisted events from expiring solely because of age. At the storage ceiling, new required events are rejected and the API fails closed instead of deleting older queued work.
 
 ### Network exposure
 
-The namespace applies default-deny ingress and explicitly permits only:
+Current intended ingress:
 
 ```text
-cloudflared -> API :8080
-API/worker  -> NATS :4222
-worker      -> ClickHouse :8123
+Internet
+  -> Cloudflare
+  -> outbound-established Tunnel
+  -> cloudflared
+  -> API Service :8080
 ```
 
-NATS and ClickHouse use ClusterIP services. The API's port 9090 administrative listener is not exposed by the public Service. Cloudflare Tunnel removes the need for an inbound WAN/NAT port.
+NATS and ClickHouse are ClusterIP-only. The API administrative listener on port 9090 is not exposed by the public Service.
 
-Assessment: **Good**.
+Current namespace ingress rules allow only:
+
+```text
+cloudflared -> API        TCP 8080
+API         -> NATS       TCP 4222
+worker      -> NATS       TCP 4222
+worker      -> ClickHouse TCP 8123
+```
 
 ### Container hardening
 
-Application manifests use non-root execution, dropped Linux capabilities, disabled privilege escalation, and read-only root filesystems where practical.
-
-A deployment-time issue was found because `runAsNonRoot: true` did not always provide Kubernetes admission with a verifiable numeric non-root identity. The validated fix pins:
+Validated runtime identities:
 
 ```text
-API/worker UID:GID 65532:65532
-NATS       UID:GID 1000:1000
+API/worker: UID 65532, GID 65532
+NATS:       UID 1000,  GID 1000
 ```
 
-This fix is tracked upstream so future deployments do not depend on a local manifest patch.
+API/worker controls include:
 
-Assessment after fix: **Good**.
+```text
+runAsNonRoot: true
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: true
+capabilities: drop ALL
+```
 
-### Secrets at rest
+Explicit numeric identities avoid Kubernetes admission ambiguity around `runAsNonRoot`.
 
-The repository recommends K3s secrets encryption using the secretbox provider. Credentials are injected through Kubernetes Secrets rather than committed into manifests.
+### Secrets
 
-Assessment: **Good, provided the production K3s configuration actually enables secrets encryption and host access is controlled**.
+Runtime credentials are referenced through `geotagger-secrets`. K3s is intended to run with secrets encryption at rest.
 
-## Findings and recommendations
+A Kubernetes Secret is not equivalent to a complete secret-management program. Node/Kubernetes administrators can be highly privileged; production controls still need administrator governance, rotation, recovery copies and incident procedures.
 
-### SEC-01 — No explicit egress-deny policy
+## Findings
+
+### SEC-01 — Pod egress is not default-deny
 
 **Severity: Medium**
 
-Current NetworkPolicies default-deny namespace ingress but do not default-deny egress. A compromised workload can therefore initiate outbound connections according to the node/CNI defaults.
+The namespace applies default-deny ingress but does not currently apply default-deny egress. A compromised workload can initiate outbound traffic according to the CNI/node defaults.
 
-Recommendation:
+Remediation:
 
-- add a namespace default-deny egress policy;
-- allow DNS explicitly;
+- stage a namespace default-deny egress policy;
+- explicitly allow cluster DNS;
+- allow API/worker only required internal destinations;
 - allow cloudflared to reach Cloudflare;
-- allow the MMDB updater to reach only required MaxMind/download endpoints where practical;
-- allow API/worker only the internal destinations they require; and
-- verify K3s/CNI behavior before rollout to avoid accidentally blocking cluster DNS or required control traffic.
+- allow the updater to reach required MaxMind endpoints; and
+- validate all flows in staging before enforcement.
 
-### SEC-02 — Static bearer keys have no built-in lifecycle metadata
+Do not deploy an egress-deny policy blindly; breaking DNS/tunnel/update traffic can make the service unavailable.
 
-**Severity: Medium**
-
-Application bearer credentials are strong secrets, but the current `API_KEYS` format is effectively a static allowlist. It does not provide built-in expiration, last-used tracking, scoped permissions, or a revocation API.
-
-Recommendation:
-
-- maintain documented issue/owner/purpose/creation/expiry metadata outside the secret itself;
-- rotate machine tokens on a defined schedule;
-- give each integration its own key ID;
-- revoke compromised callers by removing their digest and rolling the secret; and
-- consider mTLS or Cloudflare API-level machine authentication as a second factor when the client environment supports it.
-
-Do not put a browser-based Cloudflare Access login in front of machine clients unless the caller is designed to satisfy that flow.
-
-### SEC-03 — Container image reproducibility is mixed
+### SEC-02 — Caller-token lifecycle is external/manual
 
 **Severity: Medium**
 
-The ClickHouse image is digest-pinned, which is excellent. Other runtime images use version tags rather than immutable digests. A tag can be republished upstream, so a future redeploy may not be byte-for-byte identical.
+`API_KEYS` is a static allowlist of caller IDs and secret digests. The service does not track issue date, expiry, owner, last use or revocation reason.
 
-Recommendation:
+Remediation:
 
-- pin production runtime images by digest after validation;
-- retain human-readable version comments/tags next to the digest; and
-- update digests through reviewed dependency PRs.
+- unique key per integration/environment;
+- external credential inventory;
+- documented rotation interval;
+- immediate revocation procedure;
+- alert/review of unusual caller activity; and
+- consider mTLS or signed workload identity for higher-assurance deployments.
 
-### SEC-04 — ClickHouse SQL least privilege can be tightened
+See `MFA_AND_IDENTITY.md`.
+
+### SEC-03 — Runtime image reproducibility is mixed
+
+**Severity: Medium**
+
+ClickHouse is digest-pinned. Several other images use version or `latest` tags. Mutable tags reduce byte-for-byte reproducibility.
+
+Remediation:
+
+- pin production application and infrastructure images by digest after validation;
+- retain readable version metadata next to each digest; and
+- update image references through reviewed changes/CI.
+
+### SEC-04 — ClickHouse SQL privileges need explicit least privilege
 
 **Severity: Low/Medium**
 
-NetworkPolicy limits ClickHouse ingress to the audit worker, and the worker uses a dedicated `geotagger_ingest` identity. However, the deployment does not currently demonstrate a narrowly scoped SQL RBAC grant limited to only the required database/table operations.
+The worker uses a dedicated `geotagger_ingest` identity and NetworkPolicy restricts network access. The manifests do not demonstrate a minimal SQL role limited strictly to required operations.
 
-Recommendation:
+Remediation:
 
 - create explicit ClickHouse roles/users;
-- grant only the insert/select/metadata privileges actually required by the worker/operations path;
-- prevent schema/admin operations from the ingest identity; and
-- keep administrative credentials separate from application secrets.
+- grant only required insert/query/metadata privileges;
+- separate schema/admin identity from ingest identity; and
+- verify privileges in deployment validation.
 
-### SEC-05 — Single-node state is an availability/security risk
+### SEC-05 — Backup/restore control is not yet proven
+
+**Severity: Medium; higher if ePHI or required audit evidence is stored**
+
+Persistent volumes protect against Pod recreation, not VM/storage/host loss. A backup on the same VM/disk is not an independent backup.
+
+Remediation:
+
+- approve RPO/RTO;
+- back up required ClickHouse/NATS/recovery material to an independent failure domain;
+- protect backup credentials/data;
+- test full restore into a clean environment; and
+- retain evidence of restore exercises.
+
+See `BACKUP_RECOVERY.md`.
+
+### SEC-06 — Single-node infrastructure remains a single failure domain
 
 **Severity: Medium operational risk**
 
-NATS, ClickHouse, K3s control plane, the VM, the Proxmox host, local power, and the local network are single failure domains. HPA protects against API-process load but does not provide infrastructure HA.
+One physical host and one GeoTagger VM contain the K3s control plane, API, NATS, worker, ClickHouse and tunnel connector.
 
-Recommendation:
+HPA protects against API-process load/failure; it does not protect against VM, host, power, storage or local-network failure.
 
-- define recovery time and recovery point objectives;
-- automate/configure backups;
-- test ClickHouse restore procedures;
-- document how JetStream state is recovered;
-- retain Kubernetes manifests/secrets recovery material securely; and
-- move to separate failure domains only if the availability requirement justifies the added complexity.
+Remediation depends on the required availability target. Do not add multi-node stateful complexity until an RTO/RPO/SLO requires it.
 
-### SEC-06 — Compliance depends on non-code controls
+### SEC-07 — Privileged-human MFA/access governance is external to GeoTagger
 
-**Severity: High if ePHI/regulated data enters the path; otherwise informational**
+**Severity: Medium; High if administrators can access ePHI or regulated audit data**
 
-The architecture contains useful technical safeguards, but HIPAA or equivalent compliance is not established by code alone.
+The machine API has no human login, so interactive MFA is not part of `/v1/country`. However, Cloudflare, GitHub, Proxmox, Kubernetes administration, SSH/VPN/bastion, backup systems and secret stores can change or expose the service.
 
-Before transmitting ePHI through this service, complete:
+Remediation:
 
-- formal risk analysis;
-- vendor/BAA review, including Cloudflare where applicable;
-- access-control and account-review procedures;
-- incident response;
-- backup/restore validation;
-- retention/destruction policy;
-- workforce/device controls; and
-- security monitoring/review.
+- unique named administrator identities;
+- MFA for privileged human access where supported;
+- prefer phishing-resistant FIDO2/WebAuthn/passkeys/security keys;
+- protect recovery methods;
+- least privilege;
+- periodic access review; and
+- documented break-glass process.
 
-Do not label the deployment "HIPAA compliant" solely because the application uses encryption, audit logs, or private networking.
+See `MFA_AND_IDENTITY.md` for the current-HIPAA-rule versus proposed-MFA-rule distinction.
 
-### SEC-07 — Load generator and target shared a CPU failure domain
+### SEC-08 — Compliance requires non-code controls and vendor review
 
-**Severity: Informational**
+**Severity: High if ePHI enters the service path; informational otherwise**
 
-The production benchmark ran k6 on the same VM as the stack. This is not a confidentiality/integrity vulnerability, but it can produce misleading capacity assumptions. Overstating capacity is an availability risk.
+Technical controls in this repository do not establish HIPAA compliance.
 
-Recommendation: repeat the ceiling test from an external generator and base production rate limits/SLOs on that result.
+Before ePHI use, the regulated entity/business associate must address, as applicable:
 
-## Security test checklist
+- formal risk analysis and risk management;
+- security responsibility and workforce controls;
+- vendor/BAA review, including Cloudflare/backup providers where they handle ePHI;
+- access-control/identity procedures;
+- backup/contingency testing;
+- incident and breach procedures;
+- audit review/retention;
+- documentation retention; and
+- periodic technical/nontechnical evaluation.
 
-Before each production release, verify at minimum:
+See `HIPAA_READINESS.md`.
+
+### SEC-09 — Load test shared the target's CPU
+
+**Severity: Informational / availability planning**
+
+k6 ran on the same 9-vCPU VM as the target stack. That does not create a confidentiality vulnerability, but it can understate capacity and distort HPA/CPU behavior.
+
+Remediation: run the next capacity test from an external generator and use origin/audit latency metrics. See `PERFORMANCE_TUNING.md`.
+
+## Release security checklist
 
 ```text
-[ ] no secrets are committed
-[ ] invalid/missing bearer token -> 401
-[ ] private IP target -> 422
-[ ] malformed JSON/IP is rejected
-[ ] response carries X-Request-ID
-[ ] matching audit row is present
+[ ] no plaintext production secrets are committed
+[ ] invalid/missing bearer token returns 401
+[ ] valid private target returns 422
+[ ] malformed/oversized JSON is rejected
+[ ] every response has X-Request-ID
+[ ] matching audit row reaches ClickHouse
 [ ] raw IP is absent when AUDIT_IP_MODE=hmac
-[ ] authentication-failure audit does not contain target IP
-[ ] API cannot succeed normally when durable audit publication is unavailable
+[ ] authentication-failure audit does not retain target IP
+[ ] API fails closed if required durable audit publication cannot complete
 [ ] NATS is not Internet/LAN exposed
 [ ] ClickHouse is not Internet/LAN exposed
 [ ] port 9090 is not publicly exposed
 [ ] NetworkPolicy enforcement is active
-[ ] Kubernetes Secrets encryption is enabled
-[ ] containers run with expected numeric non-root UID/GID
+[ ] Kubernetes Secrets encryption is verified
+[ ] containers run with expected numeric non-root identities
 [ ] capabilities remain dropped
 [ ] read-only rootfs remains enabled where designed
-[ ] backup and restore procedures are current
+[ ] production image references are approved
+[ ] caller credential inventory/rotation status is current
+[ ] privileged administrator MFA/access review is current
+[ ] backup/restore evidence is current
+[ ] incident-response contacts/runbook are current
+[ ] data classification and HIPAA gate match the environment
 ```
 
-## Residual risk statement
+## Residual risk
 
-With the numeric UID/GID deployment fix applied, the current GeoTagger implementation is suitable as a hardened prototype/internal machine service when operated within its documented single-node availability boundary. The largest remaining risks are credential/operations governance, unrestricted pod egress, single-node availability, and compliance obligations external to the codebase.
+For a controlled internal machine service, the current code and deployment model provide a reasonable security foundation. Before a regulated production deployment, the unresolved items above must be dispositioned through the organization's risk-management process, with evidence for vendor contracts, identity/access, backups, incident response, audit handling and recovery.

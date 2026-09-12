@@ -70,9 +70,13 @@ func (s *Server) AdminHandler() http.Handler {
 
 func (s *Server) requestMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
 		s.metrics.requests.Add(1)
 		s.metrics.inflight.Add(1)
-		defer s.metrics.inflight.Add(-1)
+		defer func() {
+			s.metrics.inflight.Add(-1)
+			s.metrics.ObserveRequest(uint64(time.Since(started).Microseconds()))
+		}()
 
 		id := requestID()
 		w.Header().Set("X-Request-ID", id)
@@ -178,7 +182,10 @@ func (s *Server) publishAudit(parent context.Context, caller string, ip netip.Ad
 	if ip.IsValid() {
 		event.IPValue = audit.IPValue(s.auditIPMode, s.auditHMACKey, ip)
 	}
-	if err := s.audit.Publish(ctx, event); err != nil {
+	started := time.Now()
+	err := s.audit.Publish(ctx, event)
+	s.metrics.ObserveAuditPublish(uint64(time.Since(started).Microseconds()))
+	if err != nil {
 		s.metrics.auditFailures.Add(1)
 		return false
 	}

@@ -26,11 +26,20 @@ func (c *ClickHouse) Insert(ctx context.Context, rows [][]byte) error {
 	if len(rows) == 0 {
 		return nil
 	}
+
+	// Batch sizes are bounded by worker configuration. Pre-sizing avoids the
+	// repeated buffer growth/copy cycle on every ClickHouse flush.
+	bodyBytes := len(rows) // one newline per row
+	for _, row := range rows {
+		bodyBytes += len(row)
+	}
 	var body bytes.Buffer
+	body.Grow(bodyBytes)
 	for _, row := range rows {
 		body.Write(row)
 		body.WriteByte('\n')
 	}
+
 	q := url.Values{}
 	q.Set("query", "INSERT INTO geotagger.audit_events FORMAT JSONEachRow")
 	q.Set("date_time_input_format", "best_effort")

@@ -15,7 +15,7 @@ metadata:
   name: geotagger-api
   namespace: geotagger
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels: {app: geotagger-api}
   template:
@@ -58,7 +58,12 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 6
           resources:
-            requests: {cpu: 250m, memory: 64Mi}
+            # HPA CPU utilization is calculated against requests, not limits.
+            # 250m made the 65% target equal only 162.5m per Pod and caused
+            # aggressive over-scaling on the 9-vCPU single-node deployment.
+            # 750m keeps headroom for NATS/ClickHouse/worker while making the
+            # scaling signal better match actual CPU pressure.
+            requests: {cpu: 750m, memory: 64Mi}
             limits: {cpu: "2", memory: 256Mi}
           securityContext:
             allowPrivilegeEscalation: false
@@ -85,7 +90,7 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: geotagger-api
-  minReplicas: 1
+  minReplicas: 2
   maxReplicas: 8
   behavior:
     scaleUp:

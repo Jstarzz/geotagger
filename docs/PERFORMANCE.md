@@ -2,9 +2,9 @@
 
 ## Scope
 
-This document records the first end-to-end load test of the deployed GeoTagger stack on the on-premises server. It is a deployment-capacity measurement, not a theoretical benchmark of the Go lookup handler in isolation.
+This report records the first end-to-end load test of the deployed GeoTagger stack on the on-premises server. It measures the complete public request path, not the Go lookup handler in isolation.
 
-The tested path was:
+Tested path:
 
 ```text
 k6 on the GeoTagger VM
@@ -17,14 +17,14 @@ k6 on the GeoTagger VM
   -> durable NATS JetStream ACK
   -> response
 
-and asynchronously:
+asynchronous audit persistence:
 
 JetStream -> audit worker -> ClickHouse
 ```
 
-The same 9-vCPU VM hosted both the k6 load generator and the complete K3s stack, so the generator and server competed for the same CPU resources.
+The same 9-vCPU VM hosted both k6 and the complete K3s stack, so the load generator competed with the target for CPU.
 
-## Test results
+## Historical test result
 
 | Target tier | Achieved throughput | Reported failure rate | p95 | p99 | HDD utilization |
 |---:|---:|---:|---:|---:|---:|
@@ -33,61 +33,115 @@ The same 9-vCPU VM hosted both the k6 load generator and the complete K3s stack,
 | 5,000 RPS | ~1,373 req/s | 75.6% | 14.3 s | 20.3 s | <3% |
 | 10,000 RPS | ~322-643 req/s | 26-37%+ | 6.2-8.2 s | much higher | <1% |
 
-`*` The approximately 25% baseline failure rate at the lower tiers was not an infrastructure failure. Three of the twelve fixture IPs used by `test/load/k6.js` returned the API's valid `404 country not found` result for the installed GeoLite2 snapshot, while the k6 script currently considers only HTTP 200 a successful check. The affected fixtures observed during this run were `1.1.1.1`, `9.9.9.9`, and `2606:4700:4700::1111`.
+`*` The approximately 25% low-tier failure rate was a test-harness artifact, not an infrastructure failure. Three of the twelve valid public fixture IPs returned the legitimate application result `404 country not found` for the installed GeoLite2 snapshot. The historical k6 script counted only HTTP 200 as a passing check.
 
-A future load harness should distinguish a valid `404 country not found` application result from transport/server failure before comparing failure percentages.
+The affected fixtures observed in that run were:
 
-## Primary bottleneck
+```text
+1.1.1.1
+9.9.9.9
+2606:4700:4700::1111
+```
 
-The observed bottleneck was CPU, not the HDD.
+The load script has since been fixed to treat both 200 and 404 as expected lookup outcomes. Unexpected 4xx/5xx responses still fail the test.
+
+## Observed bottleneck
+
+CPU contention appeared before storage contention.
 
 During the test:
 
 - HDD utilization remained below 3%;
-- NATS durable publishing did not become the limiting resource;
+- NATS durable publishing did not appear to be the limiting resource;
 - ClickHouse writes did not saturate the disk;
-- queued audit work drained after the tests; and
-- durability settings were not relaxed to improve the benchmark.
+- queued audit work drained after every tier; and
+- audit durability settings were not weakened for the benchmark.
 
-The VM was simultaneously running:
+The VM was running all of the following at once:
 
 - k6;
-- K3s/control-plane components;
-- one or more Go API pods;
+- K3s/control-plane processes;
+- API Pods;
 - NATS JetStream;
 - the audit worker;
 - ClickHouse; and
 - cloudflared.
 
-At higher offered load, CPU contention caused request latency to rise sharply before storage became a constraint.
+At offered load above the sustainable range, CPU contention drove large tail-latency increases.
 
-## Practical capacity statement
+## Current capacity statement
 
-For this specific deployment and test topology, a reasonable operational estimate is:
+For the exact topology used in the historical test, the current defensible operational estimate is:
 
 ```text
-~500-1,000 requests/second for sustained service before latency degrades sharply
+roughly 500-1,000 requests/second before tail latency becomes poor
 ```
 
-This is an operational estimate, not a clean hardware ceiling. The 1,000-RPS test was already load-generator/VU constrained and showed multi-second tail latency, so workloads requiring consistently low latency should be sized more conservatively until an external-generator test is complete.
+This is not a clean server-side ceiling. The 1,000-RPS tier was already VU/load-generator constrained and showed multi-second tail latency. The 5,000-RPS tier briefly achieved about 1,373 requests/second, but with p95 around 14.3 seconds; that is not suitable for a low-latency SLO.
 
-The service did demonstrate burst throughput above 1,000 requests/second, reaching approximately 1,373 requests/second at the 5,000-RPS tier, but latency at that point was not suitable for a low-latency production SLO.
+A new benchmark is required after the HPA/observability changes described below.
 
-## Why this does not prove a 10k-RPS ceiling
+## Post-test performance changes
 
-The original design target was 10,000 requests/second, but this run does not fairly establish whether the server-side stack alone can or cannot reach that figure because:
+The following changes were made after the historical test:
 
-1. the load generator shared the same CPU as the target;
-2. traffic left the VM and traversed the public Cloudflare path before returning;
-3. k6 virtual-user availability limited at least one tier;
-4. the fixture set counted valid `404` responses as failed checks; and
-5. the test exercised the full durable audit contract rather than a lookup-only microbenchmark.
+### HPA tuning
 
-The results therefore represent the real deployed path under a deliberately difficult test arrangement, not an isolated maximum of the handler/MMDB implementation.
+Original API CPU request:
 
-## Recommended clean ceiling test
+```text
+250m
+```
 
-Run k6 from a separate machine with sufficient CPU and network capacity. Preserve the production durability settings.
+With a 65% HPA target, that meant the scaling target was only 162.5m CPU per Pod. Eight Pods corresponded to roughly 1.3 aggregate API cores at target, so the HPA could scale out far earlier than the 9-vCPU node required.
+
+The tuned deployment uses:
+
+```text
+minimum replicas: 2
+maximum replicas: 8
+CPU request:      750m per API Pod
+CPU limit:        2 per API Pod
+HPA target:       65%
+```
+
+This raises the per-Pod target to about 487.5m CPU and reduces unnecessary process/Pod proliferation at modest load while retaining scale-out capacity.
+
+### Additional origin metrics
+
+The API now exposes:
+
+```text
+geotagger_lookup_latency_microseconds
+geotagger_audit_publish_latency_microseconds
+geotagger_request_latency_microseconds
+```
+
+These separate local MMDB cost, synchronous JetStream durable-ACK cost, and total origin handler cost.
+
+### Load-harness correction
+
+HTTP 404 `country not found` for a valid public IP is now treated as an expected application result. This removes the historical false ~25% failure baseline.
+
+### Worker allocation reduction
+
+The audit worker now reuses the batch row slice and pre-sizes ClickHouse NDJSON buffers. This is a small asynchronous-path optimization rather than a primary request-throughput change.
+
+## Why the first run does not establish a 10k-RPS limit
+
+The first run cannot cleanly prove whether the server-side stack can or cannot reach 10,000 RPS because:
+
+1. k6 consumed the same VM CPU as the target;
+2. traffic traversed the public Cloudflare/WAN path;
+3. VU availability limited at least one tier;
+4. the historical fixture check counted valid 404 outcomes as failures; and
+5. the benchmark preserved the full durable-audit contract rather than testing lookup-only code.
+
+The result is useful as a deployed-path stress test, but not as an isolated maximum throughput figure.
+
+## Clean benchmark plan
+
+Run k6 from a separate machine with enough CPU and network capacity. Preserve production durability settings.
 
 Suggested stages:
 
@@ -102,31 +156,44 @@ Suggested stages:
 then increase only while latency/error SLOs remain acceptable
 ```
 
-At each stage collect:
+Collect at each stage:
 
 - offered and achieved RPS;
-- HTTP/application result distribution;
-- p50/p95/p99 latency;
-- API replica count;
-- API CPU and RAM;
-- host/VM CPU saturation;
-- JetStream pending messages and bytes;
-- worker throughput;
-- ClickHouse insert rate;
-- disk `await`, utilization, queue depth, and throughput; and
-- Cloudflare/public round-trip latency.
+- HTTP result distribution;
+- public p50/p95/p99 latency;
+- origin request-latency histogram;
+- JetStream publish-ACK latency histogram;
+- MMDB lookup latency;
+- HPA desired/current replicas;
+- per-Pod CPU and RAM;
+- VM CPU saturation/load/context switching;
+- JetStream pending messages/bytes/redelivery;
+- worker throughput/backlog;
+- ClickHouse insert rate/errors;
+- disk `await`, queue depth, utilization and throughput; and
+- public versus internal network RTT.
 
-Also run an internal benchmark directly against the Kubernetes Service or a local port-forward. Comparing internal and public tests separates application capacity from Cloudflare/WAN round-trip effects.
+Run two paths:
 
-## Lookup-path evidence
+```text
+A. public path
+external generator -> Cloudflare -> tunnel -> Service -> API
 
-A production lookup of `8.8.8.8` completed successfully through the public endpoint and produced request ID:
+B. internal/origin path
+trusted generator -> internal endpoint -> Service/API
+```
+
+The difference between A and B helps separate public-network latency from application latency.
+
+## Verified lookup evidence
+
+A production lookup for `8.8.8.8` returned request ID:
 
 ```text
 c75bb0a033c44dd87a9969df059dd6b4
 ```
 
-The corresponding ClickHouse audit row recorded:
+The matching ClickHouse row contained:
 
 ```text
 caller_id:         azure-prod
@@ -138,10 +205,25 @@ lookup_latency_us: 56
 ip_mode:           hmac
 ```
 
-The 56-microsecond MMDB lookup illustrates that local GeoIP resolution itself is not the dominant cost in the end-to-end public request. Authentication, durable audit acknowledgement, scheduling/CPU contention, and network round trip dominate at load.
+The 56-microsecond lookup shows that local GeoLite2 resolution is a small part of the public request cost.
+
+## Redis/cache decision
+
+Redis is not recommended for the current lookup path. The local MMDB is already memory-mapped and much cheaper than adding a network cache hop, cache invalidation, credentials, another stateful service and additional data-retention surface.
+
+An in-process IP cache is also deferred because there is no evidence that MMDB lookup CPU is material under realistic traffic.
+
+See `PERFORMANCE_TUNING.md` for the full decision record and scaling priorities.
 
 ## Durability under load
 
-The benchmark did not disable or weaken auditing. JetStream remained configured for work-queue retention with no age-based expiry, an 8-GiB byte limit, and `DiscardNew`. The backlog drained after each test.
+JetStream remains configured with:
 
-This matters when comparing GeoTagger to a lookup-only benchmark: the measured service is intentionally paying the cost of a durable audit acknowledgement before returning a successful response.
+```text
+Retention: WorkQueue
+MaxAge:    0
+MaxBytes:  8 GiB
+Discard:   DiscardNew
+```
+
+The benchmark result must be interpreted with this contract intact: the API waits for a durable JetStream publish acknowledgement before returning a normal lookup result. Performance changes must not remove that guarantee merely to improve benchmark numbers.
