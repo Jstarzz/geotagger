@@ -59,13 +59,14 @@ func (w *Worker) Run(ctx context.Context) error {
 	ticker := time.NewTicker(w.cfg.FlushInterval)
 	defer ticker.Stop()
 	batch := make([]*nats.Msg, 0, w.cfg.BatchSize)
+	rows := make([][]byte, 0, w.cfg.BatchSize)
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
-		rows := make([][]byte, len(batch))
-		for i, msg := range batch {
-			rows[i] = msg.Data
+		rows = rows[:0]
+		for _, msg := range batch {
+			rows = append(rows, msg.Data)
 		}
 		insertCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := w.cfg.Sink.Insert(insertCtx, rows)
