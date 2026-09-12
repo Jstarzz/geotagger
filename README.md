@@ -1,11 +1,22 @@
 # geotagger
 
-High-throughput, self-hosted IP-to-country API designed for a single on-prem K3s node with container autoscaling, Cloudflare Tunnel ingress, authenticated callers, and 30-day audit retention.
+High-throughput, self-hosted IP-to-country API designed for a single on-prem K3s node with API pod autoscaling, Cloudflare Tunnel ingress, authenticated callers, privacy-preserving durable audit logging, and 30-day ClickHouse audit retention.
+
+## Documentation
+
+For the complete technical handoff, start with:
+
+- [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md) — detailed project purpose, goals, components, trust boundaries, data flow, durability model, scaling, failure modes, and operational definition of success.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — detailed Mermaid diagrams covering physical deployment, Cloudflare ingress, Kubernetes topology, request/audit sequences, storage, networking, autoscaling, and recovery behavior.
+- [`docs/KUBERNETES.md`](docs/KUBERNETES.md) — GeoTagger-specific explanation of Pods vs containers, K3s/containerd, Deployments, StatefulSets, Services, HPA, PVCs, probes, NetworkPolicy, CronJobs, Secrets, and useful `kubectl` operations.
+- [`docs/API.md`](docs/API.md) — API integration guide.
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — measured load-test results and capacity interpretation.
+- [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md) — internal engineering security audit and hardening roadmap.
 
 ## Request path
 
 ```text
-Azure caller
+Authorized caller
    │ HTTPS + Cloudflare edge controls
    ▼
 Cloudflare Tunnel
@@ -80,7 +91,7 @@ This service does almost no business logic: authenticate, parse `netip.Addr`, me
 - aggressive scale-up
 - 5-minute scale-down stabilization
 
-This scales **containers on the one physical node**, not hardware. The ceiling is still the node's CPU/RAM. Benchmark before changing the limits; one Go process may already exceed the 10k RPS target.
+This scales **API Pods on the one physical K3s node**, not hardware. The ceiling is still the VM/node CPU and RAM. Once the VM is saturated, creating more Pods cannot manufacture additional compute.
 
 K3s includes Metrics Server by default. Verify it before depending on HPA:
 
@@ -89,7 +100,7 @@ kubectl top nodes
 kubectl -n geotagger top pods
 ```
 
-## Audit retention
+## Audit retention and durability
 
 ClickHouse uses a `MergeTree` table partitioned by day with:
 
@@ -97,7 +108,18 @@ ClickHouse uses a `MergeTree` table partitioned by day with:
 TTL timestamp + INTERVAL 30 DAY DELETE
 ```
 
-NATS JetStream uses work-queue retention and a 7-day maximum age as a durable outage buffer; acknowledged rows are removed after the ClickHouse write succeeds. The audit worker batches writes to ClickHouse and uses a 60-second acknowledgement window so a slow batch does not get redelivered while its ClickHouse insert is still within its timeout.
+NATS JetStream is a durable transport/buffer for audit events that have not yet been successfully persisted to ClickHouse. The production stream uses:
+
+```text
+Retention: WorkQueue
+MaxAge:    0
+MaxBytes:  8 GiB
+Discard:   DiscardNew
+```
+
+`MaxAge=0` is deliberate: required unpersisted audit events do not expire merely because an outage lasts a long time. If JetStream reaches the configured 8-GiB capacity, `DiscardNew` rejects new publishes rather than deleting older queued work. Because the API waits for a durable publish acknowledgement, this causes the lookup path to fail closed instead of silently returning successful unaudited responses.
+
+The audit worker batches writes to ClickHouse and acknowledges consumed JetStream messages only after persistence succeeds. The pipeline is at-least-once, so a worker crash after a ClickHouse insert but before the NATS ACK can create a duplicate audit row; use `request_id` when deduplication matters.
 
 The included ClickHouse PVC requests `50Gi`; that is only an initial deployment size, **not** a 10k-RPS-sustained capacity claim. Size disk from measured average RPS, compressed bytes/event, and the 30-day retention target after the first load test.
 
