@@ -16,6 +16,13 @@ const publicIPs = [
   '2a10:50c0::ad1:ff',
 ];
 
+// A public IP can legitimately have no country record in a particular
+// GeoLite2 snapshot. Treat 404 as an expected application result so k6's
+// transport failure metric measures actual service failures rather than
+// dataset coverage. The per-request check below still rejects all other
+// unexpected statuses.
+http.setResponseCallback(http.expectedStatuses(200, 404));
+
 export const options = {
   scenarios: {
     lookup: {
@@ -44,7 +51,7 @@ export default function () {
   });
 
   check(res, {
-    'status 200': (r) => r.status === 200,
+    'expected lookup result': (r) => r.status === 200 || r.status === 404,
     'request id returned': (r) => Boolean(r.headers['X-Request-Id']),
   });
 }
