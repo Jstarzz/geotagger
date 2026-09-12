@@ -1,114 +1,131 @@
-# geotagger
+# GeoTagger
 
-High-throughput, self-hosted IP-to-country API designed for a single on-prem K3s node with API pod autoscaling, Cloudflare Tunnel ingress, authenticated callers, privacy-preserving durable audit logging, and 30-day ClickHouse audit retention.
+GeoTagger is a self-hosted, authenticated IP-to-country API for an on-premises K3s deployment. It uses a local MaxMind GeoLite2 Country database, requires durable audit acceptance through NATS JetStream before normal success, and persists audit events asynchronously to ClickHouse.
+
+Production endpoint:
+
+```text
+https://geo.itsjosiahdavis.dev
+```
 
 ## Documentation
 
-For the complete technical handoff, start with:
+Start with the documentation index:
 
-- [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md) — detailed project purpose, goals, components, trust boundaries, data flow, durability model, scaling, failure modes, and operational definition of success.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — detailed Mermaid diagrams covering physical deployment, Cloudflare ingress, Kubernetes topology, request/audit sequences, storage, networking, autoscaling, and recovery behavior.
-- [`docs/KUBERNETES.md`](docs/KUBERNETES.md) — GeoTagger-specific explanation of Pods vs containers, K3s/containerd, Deployments, StatefulSets, Services, HPA, PVCs, probes, NetworkPolicy, CronJobs, Secrets, and useful `kubectl` operations.
-- [`docs/API.md`](docs/API.md) — API integration guide.
-- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — measured load-test results and capacity interpretation.
-- [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md) — internal engineering security audit and hardening roadmap.
+- [`docs/README.md`](docs/README.md) — complete technical/operational handoff
+- [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md) — service purpose, components and request lifecycle
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — production architecture and diagrams
+- [`docs/KUBERNETES.md`](docs/KUBERNETES.md) — K3s/Kubernetes resource model and operations
+- [`docs/API.md`](docs/API.md) — API integration contract
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — measured load-test results
+- [`docs/PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md) — applied tuning, Redis/cache decision and scaling roadmap
+- [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md) — security review and remediation priorities
+- [`docs/HIPAA_READINESS.md`](docs/HIPAA_READINESS.md) — pre-ePHI control matrix and compliance gate
+- [`docs/MFA_AND_IDENTITY.md`](docs/MFA_AND_IDENTITY.md) — machine identity and privileged-human MFA policy
+- [`CHANGELOG.md`](CHANGELOG.md) — notable changes
 
 ## Request path
 
 ```text
 Authorized caller
-   │ HTTPS + Cloudflare edge controls
-   ▼
-Cloudflare Tunnel
-   ▼
-K3s Service
-   ▼
-Go API pods (HPA 1..8)
-   │
-   ├─ local memory-mapped GeoLite2 Country MMDB
-   └─ durable JetStream audit publish
-             ▼
-            NATS
-             ▼
-      batched audit worker
-             ▼
-         ClickHouse
-          TTL 30d
+    |
+    | HTTPS
+    v
+Cloudflare
+    |
+    | Cloudflare Tunnel
+    v
+cloudflared
+    |
+    v
+Kubernetes Service
+    |
+    v
+GeoTagger API Pods
+    |                \
+    |                 \ durable publish + ACK
+    v                  v
+GeoLite2 MMDB      NATS JetStream
+                       |
+                       v
+                  audit worker
+                       |
+                       v
+                   ClickHouse
 ```
 
-The lookup path never queries an external GeoIP API or database. MaxMind data is downloaded to the on-prem node and memory-mapped by each API process.
+The lookup itself is local; normal requests do not call MaxMind or another GeoIP provider over the network.
 
 ## API
 
-`POST /v1/country`
+```http
+POST /v1/country
+Authorization: Bearer <key-id.secret>
+Content-Type: application/json
+```
 
 ```json
 {"ip":"8.8.8.8"}
 ```
 
+Successful lookup:
+
 ```json
 {"country":"United States"}
 ```
 
-Every response includes a server-generated `X-Request-ID`. The same ID is persisted in the audit record so application failures and audit rows can be correlated without putting the queried IP in ordinary access logs.
+Every response includes `X-Request-ID`. The request ID is also stored in the audit event so a response can be correlated with its persisted audit record.
 
-Authentication uses a per-caller bearer token in the form `key-id.secret`. The server stores only the SHA-256 digest of each secret. Generate one with:
+Generate a caller credential with:
 
 ```bash
 go run ./cmd/keygen azure-prod
 ```
 
-Give the printed `client token` to the caller and place only the printed `API_KEYS entry` in the server secret.
+The client receives the generated token. The server stores only the corresponding SHA-256 digest entry.
+
+Private, loopback and link-local target addresses are rejected by default.
 
 ## Security model
 
-- Cloudflare edge should restrict the public hostname to approved machine clients (mTLS/API Shield or equivalent policy).
-- The Go service independently requires a per-service application token.
-- Authentication failures are audited without parsing or retaining the requested target IP.
-- The origin is reached through Cloudflare Tunnel; no inbound origin port needs to be exposed.
-- Kubernetes `NetworkPolicy` defaults namespace ingress to deny and permits only Cloudflared→API, API/worker→NATS, and worker→ClickHouse paths.
-- The API Kubernetes Service exposes only port `8080`; `/metrics`, `/healthz`, and `/readyz` remain pod-internal on `9090` for probes/administration.
-- API and worker containers run non-root with read-only root filesystems and dropped capabilities.
-- Request bodies are bounded; unknown JSON fields are rejected.
-- Private/loopback/link-local lookup targets are rejected by default.
-- Successful responses are returned only after JetStream acknowledges the audit event; ClickHouse is not on the request path.
-- Raw target IPs are **not** stored by default. Audit records use HMAC-SHA256 so repeated IPs can be correlated without retaining the original IP. `AUDIT_HMAC_KEY` must be at least 32 bytes. Set `AUDIT_IP_MODE=raw` only if the compliance requirement explicitly demands it.
-- ClickHouse is cluster-internal and uses the dedicated `geotagger_ingest` identity; the network policy allows its HTTP port only from the audit worker.
+Current technical controls include:
 
-**HIPAA note:** software architecture alone does not make a deployment HIPAA compliant. If ePHI traverses Cloudflare or another vendor, use the appropriate service tier and execute the required BAA. Keep organizational controls, risk analysis, access review, incident response, backup/restore testing, and retention/destruction procedures with the deployment documentation.
+- per-caller machine credentials;
+- SHA-256 server-side secret digests and constant-time verification;
+- HMAC-SHA256 IP audit mode by default;
+- bounded request bodies and strict JSON parsing;
+- Cloudflare Tunnel instead of an inbound public origin port;
+- default-deny Kubernetes namespace ingress;
+- internal-only NATS and ClickHouse Services;
+- numeric non-root UIDs for API, worker and NATS;
+- dropped Linux capabilities and read-only root filesystems for Go application containers;
+- separate internal admin listener for health/readiness/metrics; and
+- durable JetStream acceptance before normal lookup success.
 
-## Why Go
+GeoTagger is a machine API, so interactive MFA is not performed on each API request. Privileged human access to Cloudflare, GitHub, Proxmox, Kubernetes administration, backup/secret systems and any future human admin UI should use MFA. See [`docs/MFA_AND_IDENTITY.md`](docs/MFA_AND_IDENTITY.md).
 
-This service does almost no business logic: authenticate, parse `netip.Addr`, memory-map lookup, durable audit publish, encode a tiny response. Go keeps that path small and concurrency-friendly without a JS runtime or unnecessary framework.
+The repository does not claim that the deployment is HIPAA compliant. Before ePHI use, complete the risk analysis, vendor/BAA review, backup/recovery, identity/access, incident-response, audit-retention and other controls in [`docs/HIPAA_READINESS.md`](docs/HIPAA_READINESS.md).
 
-## Autoscaling
+## Kubernetes autoscaling
 
-`deploy/k3s/api.yaml` defines a Kubernetes HPA:
+`deploy/k3s/api.yaml` configures:
 
-- min: 1 API pod
-- max: 8 API pods
-- CPU target: 65%
-- aggressive scale-up
-- 5-minute scale-down stabilization
-
-This scales **API Pods on the one physical K3s node**, not hardware. The ceiling is still the VM/node CPU and RAM. Once the VM is saturated, creating more Pods cannot manufacture additional compute.
-
-K3s includes Metrics Server by default. Verify it before depending on HPA:
-
-```bash
-kubectl top nodes
-kubectl -n geotagger top pods
+```text
+minimum API replicas: 2
+maximum API replicas: 8
+CPU request per API Pod: 750m
+CPU limit per API Pod: 2
+HPA CPU target: 65% of request
+scale-down stabilization: 5 minutes
 ```
 
-## Audit retention and durability
+The CPU request was raised from `250m` because HPA utilization is calculated against the request. At `250m`, a 65% target represented only `162.5m` per Pod and caused overly aggressive scale-out on the 9-vCPU single-node deployment.
 
-ClickHouse uses a `MergeTree` table partitioned by day with:
+Autoscaling changes Pod count; it does not add hardware. All API Pods currently share the same VM CPU budget.
 
-```sql
-TTL timestamp + INTERVAL 30 DAY DELETE
-```
+## Audit durability
 
-NATS JetStream is a durable transport/buffer for audit events that have not yet been successfully persisted to ClickHouse. The production stream uses:
+JetStream configuration:
 
 ```text
 Retention: WorkQueue
@@ -117,23 +134,60 @@ MaxBytes:  8 GiB
 Discard:   DiscardNew
 ```
 
-`MaxAge=0` is deliberate: required unpersisted audit events do not expire merely because an outage lasts a long time. If JetStream reaches the configured 8-GiB capacity, `DiscardNew` rejects new publishes rather than deleting older queued work. Because the API waits for a durable publish acknowledgement, this causes the lookup path to fail closed instead of silently returning successful unaudited responses.
+`MaxAge=0` prevents required unpersisted audit events from expiring solely because they are old. When the 8-GiB limit is reached, `DiscardNew` rejects new required audit events instead of deleting older queued work. The API then fails closed rather than returning an unaudited normal result.
 
-The audit worker batches writes to ClickHouse and acknowledges consumed JetStream messages only after persistence succeeds. The pipeline is at-least-once, so a worker crash after a ClickHouse insert but before the NATS ACK can create a duplicate audit row; use `request_id` when deduplication matters.
+The worker inserts ClickHouse rows in batches and ACKs NATS only after successful persistence. Delivery is at least once; a crash after ClickHouse insert but before NATS ACK can create a duplicate row. Use `request_id` when deduplication matters.
 
-The included ClickHouse PVC requests `50Gi`; that is only an initial deployment size, **not** a 10k-RPS-sustained capacity claim. Size disk from measured average RPS, compressed bytes/event, and the 30-day retention target after the first load test.
+Current ClickHouse audit TTL:
 
-### ClickHouse CPU compatibility
+```sql
+TTL timestamp + INTERVAL 30 DAY DELETE
+```
 
-The on-prem host uses an older pre-AVX2 Xeon generation. ClickHouse 26.6+ changed the default amd64 build to x86-64-v3/AVX2, so this deployment pins `clickhouse/clickhouse-server:26.3.33.24-alpine`. The 26.3 LTS branch remains on the x86-64-v2/SSE4.2 baseline and is compatible with the node while still receiving LTS patch releases.
+That TTL is an application default, not a universal HIPAA/legal retention requirement.
 
-Do not casually bump ClickHouse to 26.6+ on this hardware. Re-check the upstream CPU baseline first.
+## Performance status
+
+First public-path load test on the 9-vCPU VM:
+
+| Target | Achieved | p95 | p99 | HDD utilization |
+|---:|---:|---:|---:|---:|
+| 100 RPS | ~100 req/s | 190 ms | 203 ms | <1% |
+| 1,000 RPS | ~668 req/s | 2.08 s | 3.81 s | <1% |
+| 5,000 RPS | ~1,373 req/s | 14.3 s | 20.3 s | <3% |
+| 10,000 RPS | ~322-643 req/s | 6.2-8.2 s | much higher | <1% |
+
+The benchmark ran k6 on the same VM as the application and routed traffic through the public Cloudflare path. CPU contention appeared before disk saturation. A verified MMDB lookup took 56 microseconds.
+
+For the tested topology, roughly 500-1,000 RPS is the current practical operating range before tail latency degrades sharply. That is not a clean server-side ceiling; the next benchmark should use an external generator.
+
+Redis is not used or recommended for the current lookup path. The local memory-mapped MMDB lookup is already faster and simpler than an additional network cache. See [`docs/PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md).
+
+The API now exports separate origin-side histograms for:
+
+```text
+geotagger_lookup_latency_microseconds
+geotagger_audit_publish_latency_microseconds
+geotagger_request_latency_microseconds
+```
 
 ## MMDB updates
 
-The updater downloads `GeoLite2-Country`, extracts only the `.mmdb`, writes it to a temporary file, fsyncs, and atomically renames it into place. A K3s CronJob checks daily. API pods check the file periodically and safely reopen/verify a changed database. HPA-created API pods reuse the already-seeded node-local MMDB; they do not each download a new copy.
+The updater downloads GeoLite2 Country, validates the replacement, fsyncs it and atomically renames it into the active path.
 
-Required secret: `MAXMIND_LICENSE_KEY`.
+Cron schedule:
+
+```text
+17 3 * * *
+```
+
+`concurrencyPolicy: Forbid` prevents overlapping update Jobs. API Pods periodically reopen a changed database safely.
+
+Required runtime secret:
+
+```text
+MAXMIND_LICENSE_KEY
+```
 
 ## Configuration
 
@@ -142,88 +196,90 @@ API variables:
 | Variable | Default | Purpose |
 |---|---:|---|
 | `HTTP_ADDR` | `:8080` | API listener |
-| `ADMIN_ADDR` | `:9090` | pod-internal probes/metrics |
+| `ADMIN_ADDR` | `:9090` | internal probes/metrics |
 | `MMDB_PATH` | `/data/GeoLite2-Country.mmdb` | MMDB path |
-| `MMDB_RELOAD_INTERVAL` | `5m` | reload check |
+| `MMDB_RELOAD_INTERVAL` | `5m` | update detection interval |
 | `API_KEYS` | required | `id:sha256hex` entries |
 | `NATS_URL` | `nats://nats:4222` | audit transport |
 | `AUDIT_IP_MODE` | `hmac` | `hmac`, `raw`, or `omit` |
-| `AUDIT_HMAC_KEY` | required for `hmac` | >=32-byte HMAC secret |
-| `AUDIT_TIMEOUT` | `50ms` | durable audit publish deadline |
-| `ALLOW_PRIVATE_IPS` | `false` | permit private targets |
+| `AUDIT_HMAC_KEY` | required for `hmac` | HMAC key, at least 32 bytes |
+| `AUDIT_TIMEOUT` | `50ms` | durable publish deadline |
+| `ALLOW_PRIVATE_IPS` | `false` | permit private lookup targets |
 
-Worker variables include `CLICKHOUSE_URL`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `BATCH_SIZE`, and `FLUSH_INTERVAL`. The deployment sets `CLICKHOUSE_USER=geotagger_ingest`.
+Worker variables include `CLICKHOUSE_URL`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `BATCH_SIZE`, `FLUSH_INTERVAL`, and NATS durable/subject settings.
 
-Generate a strong audit HMAC key and database password, for example:
+## Deployment
 
-```bash
-openssl rand -hex 32
-openssl rand -base64 36
-```
+For a fresh K3s node:
 
-## Deploy on the St. Kitts node
-
-1. Install K3s. For a fresh node, merge `deploy/k3s/k3s-config.example.yaml` into `/etc/rancher/k3s/config.yaml` before first use so Kubernetes Secrets are encrypted at rest. If K3s is already running, follow the K3s secrets-encryption rotation procedure instead of blindly overwriting the server config.
-2. Ensure Metrics Server works (`kubectl top nodes`) and do not disable K3s network-policy enforcement.
-3. Copy `deploy/k3s/secrets.example.yaml`, replace every placeholder, apply it, and do **not** commit it.
-4. Create a remotely managed Cloudflare Tunnel and configure its public hostname (for example `api.example.com`) to `http://geotagger.geotagger.svc.cluster.local:8080`.
-5. Put the tunnel token in `CLOUDFLARE_TUNNEL_TOKEN`.
-6. Ensure the node can pull the GHCR application images after they are published from `main`.
-7. Deploy:
+1. Configure K3s secrets encryption before production secrets are applied.
+2. Verify Metrics Server works.
+3. Apply the `geotagger` namespace and a local, uncommitted production Secret.
+4. Configure the Cloudflare Tunnel public hostname to the internal Service.
+5. Deploy the K3s manifests.
 
 ```bash
 kubectl apply -f deploy/k3s/namespace.yaml
-kubectl apply -f /path/to/your/secrets.yaml
+kubectl apply -f /path/to/production-secrets.yaml
 ./scripts/deploy-k3s.sh
 ```
 
-8. Verify:
+Verify:
 
 ```bash
 kubectl -n geotagger get pods,hpa,networkpolicy
 kubectl -n geotagger top pods
-
-# Public API service
-kubectl -n geotagger port-forward svc/geotagger 18080:8080
-
-# Admin listener is intentionally not exposed by a Service
-kubectl -n geotagger port-forward deployment/geotagger-api 19090:9090
-
-curl -fsS http://127.0.0.1:19090/readyz
-curl -i -sS -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"ip":"8.8.8.8"}' http://127.0.0.1:18080/v1/country
+kubectl -n geotagger get pvc
 ```
 
-The API response should contain `X-Request-ID`; use it to find the corresponding ClickHouse audit row during validation.
-
-## Load test
-
-The repo contains a k6 constant-arrival-rate test. Start below the target and ramp deliberately:
+Internal API port-forward:
 
 ```bash
-RPS=1000 DURATION=60s BASE_URL=https://api.example.com API_TOKEN="$API_TOKEN" k6 run test/load/k6.js
-RPS=5000 DURATION=60s BASE_URL=https://api.example.com API_TOKEN="$API_TOKEN" k6 run test/load/k6.js
-RPS=10000 DURATION=60s BASE_URL=https://api.example.com API_TOKEN="$API_TOKEN" k6 run test/load/k6.js
+kubectl -n geotagger port-forward svc/geotagger 18080:8080
 ```
 
-Watch HPA, CPU, memory, error rate, request p95/p99, JetStream backlog, disk I/O, ClickHouse insertion throughput, and storage growth. Do not treat 10k RPS as proven until this passes on the actual node and Azure→Cloudflare→St. Kitts path.
+Internal admin port-forward:
+
+```bash
+kubectl -n geotagger port-forward deployment/geotagger-api 19090:9090
+curl -fsS http://127.0.0.1:19090/readyz
+```
+
+End-to-end lookup:
+
+```bash
+curl -i \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"ip":"8.8.8.8"}' \
+  https://geo.itsjosiahdavis.dev/v1/country
+```
+
+A deployment is not considered validated until the returned `X-Request-ID` is also found in ClickHouse.
+
+## Load testing
+
+Run k6 from a machine other than the GeoTagger VM for capacity measurements.
+
+```bash
+RPS=100 DURATION=60s BASE_URL=https://geo.itsjosiahdavis.dev API_TOKEN="$API_TOKEN" k6 run test/load/k6.js
+RPS=500 DURATION=60s BASE_URL=https://geo.itsjosiahdavis.dev API_TOKEN="$API_TOKEN" k6 run test/load/k6.js
+RPS=1000 DURATION=60s BASE_URL=https://geo.itsjosiahdavis.dev API_TOKEN="$API_TOKEN" k6 run test/load/k6.js
+```
+
+The load script treats both HTTP 200 and the legitimate `404 country not found` application result as expected responses for valid public fixture IPs. Unexpected 4xx/5xx responses still fail the test.
 
 ## CI/CD
 
 Pull requests and feature branches:
 
-- verify the Go module graph is tidy
-- run `go test -race ./...`
-- run `go vet ./...`
-- run `govulncheck` against reachable Go code
-- render the K3s Kustomize tree
-- verify the pinned ClickHouse image exists and starts
-- build all three application container targets
+- verify the Go module graph;
+- run `go test -race ./...`;
+- run `go vet ./...`;
+- run reachable Go vulnerability checks;
+- render K3s manifests;
+- verify the pinned ClickHouse image starts;
+- build the API, worker and updater images; and
+- exercise the NATS-to-ClickHouse integration path.
 
-Pushes to `main` also publish:
-
-- `ghcr.io/jstarzz/geotagger-api:latest`
-- `ghcr.io/jstarzz/geotagger-worker:latest`
-- `ghcr.io/jstarzz/geotagger-updater:latest`
-
-GitHub Actions are pinned by commit SHA. Production application deployments should move from `latest` to immutable SHA image tags after the first node is commissioned.
+Pushes to `main` publish application images to GHCR. Production deployments should use approved immutable image tags/digests rather than relying indefinitely on `latest`.
