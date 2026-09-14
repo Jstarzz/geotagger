@@ -244,6 +244,9 @@ func downloadEdition(ctx context.Context, license, edition, dest string) error {
 }
 
 func pruneReleases(releasesDir string, keep int) error {
+	if keep < 0 {
+		return errors.New("release retention must not be negative")
+	}
 	entries, err := os.ReadDir(releasesDir)
 	if err != nil {
 		return err
@@ -255,6 +258,9 @@ func pruneReleases(releasesDir string, keep int) error {
 		}
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	if len(names) <= keep {
+		return fsyncDir(releasesDir)
+	}
 	for _, name := range names[keep:] {
 		if err := os.RemoveAll(filepath.Join(releasesDir, name)); err != nil {
 			return err
