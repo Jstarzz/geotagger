@@ -161,12 +161,12 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	now := time.Now().UTC()
 	counts := s.auth.ManagedCounts(now)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ready":              s.audit != nil && s.audit.Healthy() && s.keys.Healthy(),
-		"audit_transport":    s.audit != nil && s.audit.Healthy(),
-		"managed_key_store":  s.keys.Healthy(),
-		"managed_keys":       counts,
-		"mmdb_version":       s.lookup.Version(),
-		"server_time":        now,
+		"ready":             s.audit != nil && s.audit.Healthy() && s.keys.Healthy(),
+		"audit_transport":   s.audit != nil && s.audit.Healthy(),
+		"managed_key_store": s.keys.Healthy(),
+		"managed_keys":      counts,
+		"mmdb_version":      s.lookup.Version(),
+		"server_time":       now,
 	})
 }
 
@@ -200,6 +200,10 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	if s.auth.HasStaticID(req.ID) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "key id is reserved by a static API_KEYS credential"})
+		return
+	}
 	record, token, err := s.keys.Create(keystore.CreateInput{
 		ID: req.ID, DisplayName: req.DisplayName, Owner: req.Owner,
 		Environment: req.Environment, ExpiresAt: req.ExpiresAt,
@@ -208,13 +212,16 @@ func (s *Server) createKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
+	response := map[string]any{"key": view(record, time.Now().UTC()), "token": token}
 	if err := s.refreshVerifier(); err != nil {
 		s.logger.Error("managed key created but local verifier refresh failed", "key_id", req.ID, "error", err)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "key stored but verifier refresh failed; retry status before distributing token"})
+		response["warning"] = "key was stored, but this API replica has not refreshed its verifier; confirm dashboard status before distributing the token"
+		s.logMutation(r, "create", req.ID, "stored_refresh_pending")
+		writeJSON(w, http.StatusCreated, response)
 		return
 	}
 	s.logMutation(r, "create", req.ID, "ok")
-	writeJSON(w, http.StatusCreated, map[string]any{"key": view(record, time.Now().UTC()), "token": token})
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) rotateKey(w http.ResponseWriter, r *http.Request) {
@@ -231,13 +238,16 @@ func (s *Server) rotateKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
+	response := map[string]any{"key": view(record, time.Now().UTC()), "token": token}
 	if err := s.refreshVerifier(); err != nil {
 		s.logger.Error("managed key rotated but local verifier refresh failed", "key_id", id, "error", err)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "key rotated but verifier refresh failed; retry status before distributing token"})
+		response["warning"] = "key was rotated durably, but this API replica has not refreshed its verifier; confirm dashboard status before distributing the token"
+		s.logMutation(r, "rotate", id, "stored_refresh_pending")
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	s.logMutation(r, "rotate", id, "ok")
-	writeJSON(w, http.StatusOK, map[string]any{"key": view(record, time.Now().UTC()), "token": token})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) revokeKey(w http.ResponseWriter, r *http.Request) {
@@ -264,13 +274,16 @@ func (s *Server) revokeKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 		return
 	}
+	response := map[string]any{"key": view(record, time.Now().UTC())}
 	if err := s.refreshVerifier(); err != nil {
 		s.logger.Error("managed key revoked but local verifier refresh failed", "key_id", id, "error", err)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "key revoked but verifier refresh failed"})
+		response["warning"] = "revocation was stored, but this API replica has not refreshed its verifier; treat readiness as degraded until synchronization recovers"
+		s.logMutation(r, "revoke", id, "stored_refresh_pending")
+		writeJSON(w, http.StatusOK, response)
 		return
 	}
 	s.logMutation(r, "revoke", id, "ok")
-	writeJSON(w, http.StatusOK, map[string]any{"key": view(record, time.Now().UTC())})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) refreshVerifier() error {
