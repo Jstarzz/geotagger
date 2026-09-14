@@ -43,8 +43,8 @@ func LoadAPI() (API, error) {
 	c := API{
 		HTTPAddr:        getenv("HTTP_ADDR", ":8080"),
 		AdminAddr:       getenv("ADMIN_ADDR", ":9090"),
-		CityMMDBPath:    getenv("CITY_MMDB_PATH", "/data/GeoLite2-City.mmdb"),
-		ASNMMDBPath:     getenv("ASN_MMDB_PATH", "/data/GeoLite2-ASN.mmdb"),
+		CityMMDBPath:    getenv("CITY_MMDB_PATH", "/data/current/GeoLite2-City.mmdb"),
+		ASNMMDBPath:     getenv("ASN_MMDB_PATH", "/data/current/GeoLite2-ASN.mmdb"),
 		APIKeys:         os.Getenv("API_KEYS"),
 		NATSURL:         getenv("NATS_URL", "nats://nats:4222"),
 		AuditStream:     getenv("AUDIT_STREAM", "GEOTAGGER_AUDIT"),
