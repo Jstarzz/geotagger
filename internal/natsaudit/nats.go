@@ -70,14 +70,19 @@ func ensureAuditStream(js nats.JetStreamContext, stream, subject string) error {
 		}
 	}
 
-	// Memory-backed JetStream does not satisfy the durable-audit contract. Do
-	// not silently continue or attempt an in-place storage migration: fail the
-	// API startup/readiness path and require an explicit operator migration.
+	// Storage and retention are structural durability properties. NATS does not
+	// support changing a stream's storage backend or changing retention to/from
+	// WorkQueue in place. Refuse startup rather than silently accepting a weaker
+	// audit stream or attempting a destructive migration behind the operator's
+	// back. The operator must explicitly migrate/recreate an incompatible stream.
 	if info.Config.Storage != nats.FileStorage {
 		return fmt.Errorf("audit stream %q storage=%v; file storage is required", stream, info.Config.Storage)
 	}
+	if info.Config.Retention != nats.WorkQueuePolicy {
+		return fmt.Errorf("audit stream %q retention=%v; WorkQueue retention is required and cannot be migrated in place", stream, info.Config.Retention)
+	}
 
-	// Reconcile the mutable safety contract on every API startup. A stale stream
+	// Reconcile only mutable safety settings on every API startup. A stale stream
 	// from an older deployment must not silently weaken durability or retain ACKed
 	// work forever. WorkQueue removes successfully ACKed messages; the only
 	// configured capacity bound is MaxBytes, and DiscardNew makes that bound fail
@@ -86,10 +91,6 @@ func ensureAuditStream(js nats.JetStreamContext, stream, subject string) error {
 	changed := false
 	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != subject {
 		cfg.Subjects = []string{subject}
-		changed = true
-	}
-	if cfg.Retention != nats.WorkQueuePolicy {
-		cfg.Retention = nats.WorkQueuePolicy
 		changed = true
 	}
 	if cfg.MaxConsumers != -1 {
@@ -122,7 +123,7 @@ func ensureAuditStream(js nats.JetStreamContext, stream, subject string) error {
 	}
 	if changed {
 		if _, err := js.UpdateStream(&cfg); err != nil {
-			return fmt.Errorf("reconcile audit stream durability contract: %w", err)
+			return fmt.Errorf("reconcile mutable audit stream safety settings: %w", err)
 		}
 	}
 	return nil
