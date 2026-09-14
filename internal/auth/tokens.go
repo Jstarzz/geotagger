@@ -95,6 +95,13 @@ func (v *Verifier) ReplaceManaged(keys []ManagedKey) error {
 	return nil
 }
 
+func (v *Verifier) HasStaticID(id string) bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	_, ok := v.static[id]
+	return ok
+}
+
 func (v *Verifier) VerifyAuthorization(header string) (string, error) {
 	const prefix = "Bearer "
 	if !strings.HasPrefix(header, prefix) {
