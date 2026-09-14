@@ -26,6 +26,13 @@ All notable GeoTagger changes are recorded here. Dates use UTC calendar dates. T
 - Backup/recovery runbook and recovery evidence template.
 - Security incident-response runbook.
 - Performance tuning guide covering HPA behavior, caching/Redis decisions, benchmark methodology and future scaling options.
+- Human admin control plane at `/admin/` on the internal `:9090` listener, intended for `admin.geo.itsjosiahdavis.dev` behind Cloudflare Access.
+- Origin-side Cloudflare Access JWT validation using `Cf-Access-Jwt-Assertion`, account signing keys, issuer/audience checks and token expiry/not-before validation.
+- Managed API-key lifecycle: create, rotate, revoke and optional expiry while preserving existing static `API_KEYS` break-glass credentials.
+- File-backed NATS JetStream KV bucket `GEOTAGGER_API_KEYS` for managed key metadata/digests, with in-memory verification and cross-replica watch propagation.
+- Dedicated `geotagger-admin` ClusterIP Service on port 9090 and corresponding Tunnel-only NetworkPolicy ingress.
+- Dependency-free embedded admin UI with one-time token display, key metadata/status, MMDB status and runtime health.
+- Admin control-plane architecture/security document and Cloudflare Access/Tunnel rollout runbook.
 
 ### Changed
 
@@ -42,6 +49,8 @@ All notable GeoTagger changes are recorded here. Dates use UTC calendar dates. T
 - ClickHouse batch writer pre-sizes the NDJSON buffer to reduce repeated allocations/copies.
 - Kubernetes and architecture documentation Mermaid diagrams were rewritten with GitHub-safe quoted labels, including filesystem paths.
 - Project documentation language was tightened to distinguish implemented technical safeguards from compliance, certification and availability claims.
+- API readiness now includes managed-key-store/watch health in addition to the durable audit dependency.
+- Static API credentials remain supported but are now explicitly treated as compatibility/break-glass credentials rather than the preferred lifecycle mechanism for new integrations.
 
 ### Security / Compliance
 
@@ -49,8 +58,14 @@ All notable GeoTagger changes are recorded here. Dates use UTC calendar dates. T
 - IP-derived city/region/coordinates are explicitly documented as estimates, not GPS/device location; clients should use `accuracy_radius_km` and avoid representing the result as precise physical location.
 - Rich geolocation/network response data remains transient by default rather than being copied into durable audit storage.
 - Clarified that GeoTagger's public API is machine-to-machine and does not require interactive MFA on every API call.
-- Added an administrative MFA policy for privileged human access to Cloudflare, GitHub, Proxmox, Kubernetes administration, backup/secret systems and any future human admin UI.
+- Added an administrative MFA policy for privileged human access to Cloudflare, GitHub, Proxmox, Kubernetes administration, backup/secret systems and the human admin UI.
 - Documented the current HIPAA Security Rule versus the proposed stronger MFA requirements without claiming that a proposed rule is already final law.
+- Admin routes fail closed when Cloudflare Access configuration is absent or the Access assertion is missing/invalid.
+- Admin HTML/API responses use `no-store`, restrictive CSP/frame/referrer/permissions headers, same-origin mutation checks and a required custom CSRF header.
+- Plaintext managed secrets are returned only at creation/rotation and are not persisted by GeoTagger; only SHA-256 digests and non-secret lifecycle metadata are stored in JetStream KV.
+- Managed/static key-ID collisions are rejected rather than resolved by precedence.
+- A durable create/rotate mutation that succeeds but cannot immediately refresh the local verifier returns the one-time token with an explicit propagation warning instead of silently losing the new secret.
+- Administrative credential mutations log non-secret administrator identity, operation, key ID and outcome; a dedicated immutable admin-audit stream remains a documented future control if required.
 
 ## [2026-09-12]
 
