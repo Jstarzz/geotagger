@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	DefaultBucket = "GEOTAGGER_API_KEYS"
+	DefaultBucket  = "GEOTAGGER_API_KEYS"
 	maxBucketBytes int64 = 64 << 20
 )
 
@@ -80,6 +80,12 @@ func Open(url, bucket string) (*Store, error) {
 			Storage:     nats.FileStorage,
 			Replicas:    1,
 		})
+		if err != nil {
+			// API replicas can race to provision the bucket on the first rollout.
+			// If another replica won, bind to the now-existing bucket instead of
+			// failing startup because CreateKeyValue lost the race.
+			kv, err = js.KeyValue(bucket)
+		}
 	}
 	if err != nil {
 		nc.Close()
@@ -90,9 +96,14 @@ func Open(url, bucket string) (*Store, error) {
 		nc.Close()
 		return nil, fmt.Errorf("key store status: %w", err)
 	}
-	if status.Config().Storage != nats.FileStorage {
+	cfg := status.Config()
+	if cfg.Storage != nats.FileStorage {
 		nc.Close()
 		return nil, fmt.Errorf("key store bucket %q is not file-backed", bucket)
+	}
+	if cfg.History < 1 {
+		nc.Close()
+		return nil, fmt.Errorf("key store bucket %q has invalid history=%d", bucket, cfg.History)
 	}
 	return &Store{nc: nc, kv: kv}, nil
 }
