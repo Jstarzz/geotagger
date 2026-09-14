@@ -69,6 +69,8 @@ jobs:
       REDOCLY_SUPPRESS_UPDATE_NOTICE: 'true'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Validate deployment script syntax
+        run: sh -n scripts/deploy-k3s.sh
       - name: Render K3s manifests
         run: kubectl kustomize deploy/k3s > /tmp/geotagger-manifests.yaml
       - name: Validate OpenAPI contract
