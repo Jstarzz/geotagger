@@ -52,12 +52,22 @@ fi
 # Render first so malformed Kustomize input fails before mutating workloads.
 kubectl kustomize deploy/k3s >/dev/null
 
-# Seed/update the node-local MMDB once before API replicas start.
+# Seed/update the node-local MMDB once before API replicas start. The bootstrap
+# Job is recreated on each deployment, so its :latest updater image is pulled
+# fresh according to Kubernetes' default imagePullPolicy for the latest tag.
 kubectl -n "$namespace" delete job geotagger-mmdb-bootstrap --ignore-not-found --wait=true
 kubectl apply -f deploy/k3s/mmdb-bootstrap.yaml
 kubectl -n "$namespace" wait --for=condition=complete job/geotagger-mmdb-bootstrap --timeout=180s
 
 kubectl apply -k deploy/k3s
+
+# The application Deployments intentionally use the :latest GHCR tag. Applying
+# an unchanged Pod template does not create new Pods, so without an explicit
+# restart a deploy could leave an older API/worker image running indefinitely.
+# Restart only the application workloads; stateful data services and the pinned
+# cloudflared Deployment are left alone unless their manifests actually change.
+kubectl -n "$namespace" rollout restart deployment/geotagger-api deployment/geotagger-audit-worker
+
 kubectl -n "$namespace" rollout status statefulset/nats --timeout=180s
 kubectl -n "$namespace" rollout status statefulset/clickhouse --timeout=180s
 kubectl -n "$namespace" rollout status deployment/geotagger-api --timeout=180s
@@ -66,3 +76,9 @@ kubectl -n "$namespace" rollout status deployment/cloudflared --timeout=180s
 
 printf '\nDeployment ready.\n'
 kubectl -n "$namespace" get pods,hpa,networkpolicy
+
+printf '\nRunning application images:\n'
+kubectl -n "$namespace" get pods -l app=geotagger-api \
+  -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image,IMAGE_ID:.status.containerStatuses[0].imageID'
+kubectl -n "$namespace" get pods -l app=geotagger-audit-worker \
+  -o 'custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image,IMAGE_ID:.status.containerStatuses[0].imageID'
