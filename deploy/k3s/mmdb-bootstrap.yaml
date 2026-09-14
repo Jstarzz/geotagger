@@ -24,7 +24,8 @@ spec:
         - name: updater
           image: ghcr.io/jstarzz/geotagger-updater:latest
           env:
-            - {name: MMDB_PATH, value: /data/GeoLite2-Country.mmdb}
+            - {name: MMDB_DIR, value: /data}
+            - {name: MAXMIND_EDITIONS, value: "GeoLite2-City,GeoLite2-ASN"}
             - name: MAXMIND_LICENSE_KEY
               valueFrom: {secretKeyRef: {name: geotagger-secrets, key: MAXMIND_LICENSE_KEY}}
           volumeMounts:
