@@ -16,6 +16,9 @@ All notable GeoTagger changes are recorded here. Dates use UTC calendar dates. T
 - Atomic MMDB **bundle generation** activation: City and ASN are staged and verified together, then one `current` symlink is atomically switched to the complete new release. The three newest complete releases are retained.
 - Backward-compatible single-edition updater mode through `MAXMIND_EDITION`/`MMDB_PATH` for custom deployments.
 - Dedicated `test/load/k6-rich.js` load scenario for the rich City+ASN endpoint.
+- OpenAPI 3.1 contract for all public lookup endpoints, bearer authentication, response schemas and common errors.
+- Client quickstart covering Yaak import/manual setup, cURL examples, test addresses and audit verification.
+- City + ASN production upgrade runbook covering migration, validation, rollback and post-upgrade benchmarking.
 - Origin-side request-latency Prometheus histogram: `geotagger_request_latency_microseconds`.
 - Durable JetStream publish-latency histogram: `geotagger_audit_publish_latency_microseconds`.
 - HIPAA readiness/control matrix with an explicit pre-ePHI production gate.
