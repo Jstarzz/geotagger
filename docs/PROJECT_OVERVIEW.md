@@ -10,49 +10,50 @@ Public endpoint:
 https://geo.itsjosiahdavis.dev
 ```
 
-The core business function is now:
+The core function is:
 
 ```text
 public IP address
--> geographic estimate
--> network/ASN identity
+-> local geographic estimate
+-> local ASN/network identity
 -> source/version metadata
 -> durable audit record
 ```
 
-The project is not intended to provide GPS-quality location. IP-derived city/region/coordinates are estimates and are returned with an accuracy radius where available.
+GeoTagger is not a GPS system. City, region and coordinates are approximate IP-geolocation data and are returned with an accuracy radius when the database supplies one.
 
-## Why the service exists
+## Why this service exists
 
-A hosted service such as IPinfo can answer a simple GeoIP question, but GeoTagger is built around a different set of operational requirements:
+A hosted API can answer a basic GeoIP question, but GeoTagger is designed around additional operational requirements:
 
-- local lookup data rather than a third-party HTTP dependency per request;
+- no third-party lookup request on the hot path;
+- local City and ASN datasets;
 - machine-specific authentication;
-- privacy-preserving retained audit data;
 - durable request accounting;
-- request/audit correlation through server-generated IDs;
+- privacy-preserving retained audit data;
+- server-generated request/audit correlation IDs;
 - controlled retention and infrastructure ownership;
-- autoscaling and health-aware routing;
-- network isolation for stateful components;
-- scheduled local database refreshes; and
-- explicit source/build metadata and geolocation uncertainty.
+- Kubernetes health-aware routing and autoscaling;
+- isolated NATS/ClickHouse stateful services;
+- scheduled, verified database refreshes; and
+- explicit data provenance and location uncertainty.
 
-The architecture should therefore be evaluated as an internal infrastructure service, not merely as a replacement for a one-line `curl` command.
+The project should therefore be evaluated as an internal infrastructure service, not merely as an alternative to a one-line public GeoIP request.
 
-## Public API surface
+## API surface
 
 ```text
 POST /v1/lookup       full City + ASN intelligence
-GET  /v1/lookup?ip=  full lookup using query parameter
-GET  /v1/me           full lookup for observed caller IP
+GET  /v1/lookup?ip=  full lookup using a query parameter
+GET  /v1/me           full lookup for the observed caller IP
 POST /v1/country      backward-compatible country-only response
 ```
 
 All endpoints require the same application bearer credential.
 
-## Full intelligence model
+## Rich intelligence model
 
-A rich lookup can return:
+A successful `/v1/lookup` can include:
 
 ```text
 normalized IP
@@ -68,71 +69,117 @@ timezone
 ASN
 ASN organization
 public/private/loopback/link-local classification
-IP version
+IPv4/IPv6 classification
 City MMDB build/version
 ASN MMDB build/version
-lookup latency
+local lookup latency
 request ID
 ```
 
-Fields unavailable in the current database snapshot are left empty/omitted rather than inferred.
+Unavailable fields are omitted or left empty rather than inferred.
 
 ## Data sources
 
-GeoTagger uses:
+Production uses:
 
 ```text
 GeoLite2-City.mmdb
 GeoLite2-ASN.mmdb
 ```
 
-Both are downloaded with the existing `MAXMIND_LICENSE_KEY`. No additional third-party lookup API key is required.
+Both are downloaded with the existing `MAXMIND_LICENSE_KEY`; no additional provider/API key is needed.
 
-The API uses the Go MaxMind DB reader and keeps long-lived memory-mapped readers open for both files.
+The Go API keeps long-lived memory-mapped readers open for both databases.
 
 ## Normal request flow
 
 ```text
 authenticate caller
--> parse/normalize IP
--> apply public-address policy
--> City MMDB lookup
--> ASN MMDB lookup
--> construct response
--> create privacy-preserving audit event
+-> parse and normalize IP
+-> enforce public-address policy
+-> decode City MMDB
+-> decode ASN MMDB
+-> construct rich response
+-> create minimized privacy-preserving audit event
 -> durable JetStream publish + ACK
 -> return response
 ```
 
-ClickHouse insertion occurs asynchronously after the request returns.
+ClickHouse persistence happens asynchronously after the durable NATS acceptance.
+
+## Authentication
+
+Machine credentials use:
+
+```text
+key-id.secret
+```
+
+Only the SHA-256 digest of the secret is configured server-side. Comparison is constant-time. Authentication occurs before the requested target IP is parsed, so unauthenticated requests do not cause target-IP retention in the audit event.
+
+## Public-address policy
+
+By default GeoTagger rejects:
+
+```text
+malformed IP addresses
+RFC1918 private IPv4 addresses
+loopback addresses
+link-local addresses
+other targets that are not permitted public global-unicast addresses
+```
+
+This avoids assigning Internet geolocation semantics to internal/private addresses.
+
+## Caller self-lookup
+
+`GET /v1/me` uses the public caller address observed through the ingress path rather than an explicit request body.
+
+Current precedence:
+
+```text
+CF-Connecting-IP
+first X-Forwarded-For entry
+RemoteAddr for trusted internal/direct testing
+```
+
+Because forwarding headers can be spoofed by direct clients, the API origin must remain restricted to the intended Cloudflare Tunnel/internal path. A future direct-origin architecture must implement explicit trusted-proxy verification.
+
+## Geolocation accuracy boundary
+
+Country-level results are generally more reliable than city-level estimates. City, region and coordinates can represent an ISP allocation or approximate area rather than the endpoint's physical location.
+
+Consumers must:
+
+- not call IP-derived coordinates GPS;
+- use `accuracy_radius_km` where precision matters;
+- tolerate missing values;
+- expect results to change after database updates; and
+- not use approximate IP location as the sole basis for a high-impact decision.
 
 ## Audit model
 
-GeoTagger deliberately does not retain the full rich response by default.
+GeoTagger deliberately does **not** retain the complete rich response by default.
 
-The audit record contains:
+The ClickHouse audit record contains:
 
 ```text
 timestamp
 request ID
 caller ID
-HMAC/raw/omitted IP according to policy
+HMAC/raw/omitted IP representation according to policy
 country code/name
 outcome
 HTTP status
 lookup latency
-combined City/ASN database-version metadata
+combined City/ASN source version metadata
 ```
 
-The default IP mode is HMAC-SHA256, so the raw target IP is not stored in the ClickHouse audit row.
-
-This design allows repeated-address correlation while reducing retained identifier exposure.
+The default `AUDIT_IP_MODE=hmac` stores HMAC-SHA256 of the target IP rather than the raw address. City, coordinates, postal code, timezone and ASN remain response-only unless a future reviewed requirement explicitly adds them to durable storage.
 
 ## Durability contract
 
-Normal success depends on NATS JetStream accepting the audit event durably.
-
-Current stream safety settings:
+Normal success requires NATS JetStream to accept the audit event durably.
 
 ```text
 Retention: WorkQueue
@@ -141,11 +188,9 @@ MaxBytes:  8 GiB
 Discard:   DiscardNew
 ```
 
-If the required durable publish cannot complete, GeoTagger fails closed instead of returning a normal successful lookup without its required audit event.
+If the required publish cannot complete, GeoTagger fails closed instead of returning a normal unaudited result.
 
-## Asynchronous persistence
-
-The worker consumes JetStream messages in batches and inserts them into ClickHouse.
+## Asynchronous audit persistence
 
 ```text
 JetStream
@@ -155,73 +200,48 @@ JetStream
 -> ACK NATS only after successful persistence
 ```
 
-Delivery is at least once. A crash between ClickHouse insertion and the NATS ACK can create duplicate rows; `request_id` is available for deduplication/correlation.
+Delivery is at least once. A crash after ClickHouse accepts an insert but before NATS receives the ACK can create a duplicate. Use `request_id` for correlation/deduplication where needed.
 
-## MMDB update lifecycle
+## Atomic MMDB generation lifecycle
 
-The scheduled updater manages City and ASN together.
+City and ASN are maintained as one active **bundle generation**, not independently replaced live files.
+
+Filesystem model:
+
+```text
+/var/lib/geotagger/mmdb/
+├── current -> releases/release-<generation>/
+└── releases/
+    ├── release-<older>/
+    ├── release-<previous>/
+    └── release-<current>/
+        ├── GeoLite2-City.mmdb
+        └── GeoLite2-ASN.mmdb
+```
+
+Update lifecycle:
 
 ```text
 CronJob starts updater
--> download both archives
--> stage both MMDB files
--> fsync staged files
--> open/verify each database
--> begin live replacement only after all verification succeeds
--> atomic rename City
--> atomic rename ASN
--> fsync directory
--> API notices changed files
--> hot-reload changed readers
+-> create versioned staging directory
+-> download City archive
+-> download ASN archive
+-> write/fsync both MMDB files
+-> open and Verify both databases
+-> publish complete release directory
+-> atomically rename one current symlink
+-> fsync parent directory
+-> retain newest three complete releases
+-> API detects the new generation
+-> API opens/verifies replacement readers
+-> API swaps readers without Pod restart
 ```
 
-Each final file replacement is atomic. A host/process crash between the two final renames can temporarily leave City and ASN on different build timestamps; GeoTagger tolerates that state and exposes each source version separately.
+The atomic `current` symlink is the commit point. API processes see the old complete City+ASN generation or the new complete generation, not a mixed half-update.
 
-The updater keeps legacy single-edition configuration support for custom deployments.
-
-## Caller self-lookup
-
-`GET /v1/me` resolves the caller IP observed through the public ingress path.
-
-Preferred source:
-
-```text
-CF-Connecting-IP
-```
-
-Fallbacks exist for trusted internal/direct testing.
-
-The origin must remain restricted to the Cloudflare Tunnel/internal trust boundary. Forwarded headers must not become an untrusted identity source if the origin is later exposed directly.
-
-## Public-address policy
-
-By default, requested targets must be valid public global-unicast addresses.
-
-Rejected by default:
-
-```text
-RFC1918 private addresses
-loopback
-link-local
-malformed IPs
-```
-
-This prevents callers from treating internal/private addresses as meaningful Internet geolocation targets.
-
-## Geolocation accuracy boundary
-
-Country-level results are generally more robust than city-level results. City, region and coordinates may represent an ISP/network registration or approximate geolocation rather than the physical endpoint.
-
-Consumers must:
-
-- treat city/region as estimates;
-- display/use the returned accuracy radius where relevant;
-- avoid describing IP-derived coordinates as GPS/device location; and
-- tolerate missing or changing values after MMDB updates.
+Legacy/custom single-edition updater mode remains supported through `MAXMIND_EDITION` and `MMDB_PATH`.
 
 ## Kubernetes deployment
-
-The deployed service runs inside one K3s VM.
 
 Main resources:
 
@@ -238,130 +258,88 @@ Service/geotagger
 Service/nats
 Service/clickhouse
 NetworkPolicy objects
-Kubernetes Secret/geotagger-secrets
+Secret/geotagger-secrets
 ```
 
-See `KUBERNETES.md` for details.
+See `KUBERNETES.md` for operating details.
 
 ## API scaling
-
-Current API autoscaling:
 
 ```text
 minimum replicas: 2
 maximum replicas: 8
-CPU request: 750m
-CPU target: 65%
+CPU request:      750m
+CPU target:       65% of request
+CPU limit:        2 cores per Pod
 ```
 
-Scaling is horizontal only within the one 9-vCPU VM. It can use spare cores but cannot create new hardware capacity.
+All API Pods currently share one 9-vCPU VM. HPA can consume unused CPU but cannot create additional physical capacity or hardware HA.
 
 ## State and storage
-
-Stateful data:
 
 ```text
 NATS JetStream -> persistent volume
 ClickHouse     -> persistent volume
-City MMDB      -> node-local file
-ASN MMDB       -> node-local file
+MMDB releases  -> node-local host path on data disk
 ```
 
 API Pods are otherwise replaceable/stateless.
 
-## Security boundary
+## Security controls
 
-Implemented controls include:
+Current controls include:
 
 ```text
 per-caller bearer credentials
 server-side SHA-256 secret digests
-constant-time verification
+constant-time authentication
 HMAC IP audit mode
 strict/bounded request parsing
 Cloudflare Tunnel ingress
-Kubernetes NetworkPolicy
-internal-only NATS/ClickHouse Services
-non-root application containers
-read-only root filesystems where supported
-dropped capabilities
-internal admin listener
-K3s secret encryption recommendation
+default-deny Kubernetes ingress
+internal-only NATS and ClickHouse Services
+non-root numeric container UIDs
+read-only root filesystems where designed
+dropped Linux capabilities
+internal-only admin listener
+K3s secrets-encryption recommendation
 ```
 
-The richer response data does not change the basic authentication model.
-
-## MFA boundary
-
-Interactive MFA is for privileged humans, not automated API requests.
-
-Privileged human systems should use MFA where supported:
-
-```text
-Cloudflare
-GitHub
-Proxmox
-SSH/VPN/bastion
-Kubernetes administration
-backup/secret systems
-future human admin UI
-```
-
-Machine authentication can later be strengthened with mTLS/workload identity if needed.
+Privileged-human MFA belongs on Cloudflare, GitHub, Proxmox, SSH/VPN/bastion, Kubernetes, backup and secret-management access rather than on every automated API request. See `MFA_AND_IDENTITY.md`.
 
 ## HIPAA/compliance boundary
 
-The repository does not declare the deployment HIPAA compliant.
+The repository does not declare the deployment HIPAA compliant. Before ePHI use, complete the applicable risk analysis, risk management, vendor/BAA review, access governance, backup/restore validation, incident/breach procedures, audit review/retention, workforce controls and periodic evaluations described in `HIPAA_READINESS.md`.
 
-Before ePHI use, complete the applicable:
-
-```text
-risk analysis
-risk-management plan
-vendor/BAA review
-access-control procedures
-backup/restore validation
-incident/breach procedures
-audit retention/review
-workforce/administrative controls
-periodic evaluation
-```
-
-See `HIPAA_READINESS.md`.
+The richer location fields expand the transient response data surface, so `DATA_CLASSIFICATION.md` must be part of any regulated integration review.
 
 ## Performance status
 
-The first benchmark measured the earlier country-only implementation and found CPU contention before HDD saturation. A verified country MMDB lookup took 56 microseconds, and disk utilization stayed low during the test.
+Historical load testing measured the earlier country-only path. The rich endpoint now performs two MMDB decodes and serializes a larger response.
 
-The new full lookup performs two MMDB decodes and returns substantially more JSON, so those old throughput numbers must not be presented as measured `/v1/lookup` capacity.
-
-Required follow-up benchmark:
+Therefore:
 
 ```text
-external load generator
-country endpoint baseline
-rich POST lookup
-rich GET lookup
-self lookup
-origin-side latency metrics
-public Cloudflare latency
-CPU/HPA behavior
-JetStream ACK latency
+old 500-1,000 RPS operating estimate = historical country path only
+old 56 us lookup observation         = historical single-MMDB lookup only
 ```
 
-Redis is not currently justified because City and ASN are already local memory-mapped datasets. Add caching only if realistic traffic proves MMDB decode work is a meaningful bottleneck.
+Use `test/load/k6-rich.js` from an external load generator before publishing `/v1/lookup` capacity numbers. Origin metrics separate total handler latency, local lookup latency and durable JetStream publish latency.
 
-## Operational success criteria
+Redis remains intentionally absent. Both City and ASN datasets are already local memory-mapped files; caching should be added only if realistic rich-endpoint measurements show MMDB decode CPU is a material bottleneck.
 
-A deployment is considered functionally validated when:
+## Operational acceptance
 
-1. City and ASN MMDB files are present and verified;
-2. API Pods are ready;
-3. NATS and ClickHouse are healthy;
-4. Cloudflare Tunnel is connected;
-5. an authenticated public rich lookup succeeds;
-6. the response includes `X-Request-ID` and source metadata;
-7. the exact request ID appears in ClickHouse; and
-8. the retained `ip_value` follows the configured privacy mode.
+A rich deployment is functionally validated when:
+
+1. `current` points to a complete verified release;
+2. both City and ASN files are accessible through `current`;
+3. API Pods are ready;
+4. NATS, worker and ClickHouse are healthy;
+5. Cloudflare Tunnel is connected;
+6. an authenticated public `/v1/lookup` succeeds;
+7. response source metadata identifies both database builds;
+8. response and header request IDs match; and
+9. the exact request ID appears in ClickHouse with the configured HMAC audit mode.
 
 Capacity/SLO validation is a separate benchmark exercise.
