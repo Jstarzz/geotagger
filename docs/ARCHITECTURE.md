@@ -10,15 +10,7 @@ Public endpoint:
 https://geo.itsjosiahdavis.dev
 ```
 
-The architecture is intentionally split into three concerns:
-
-```text
-request serving
-local IP intelligence data
-asynchronous audit persistence
-```
-
-Normal requests do not call MaxMind, IPinfo, or another third-party geolocation API.
+Normal lookups do not call MaxMind, IPinfo, or another third-party geolocation API.
 
 ## 1. System context
 
@@ -27,12 +19,12 @@ flowchart LR
     CLIENT["Authorized machine client"] -->|"HTTPS"| GEO["GeoTagger"]
     GEO -->|"IP intelligence + request ID"| CLIENT
     GEO -->|"durable audit event"| AUDIT["Audit pipeline"]
-    UPDATER["Scheduled updater"] -->|"GeoLite2 City + ASN"| GEO
+    UPDATER["Scheduled updater"] -->|"atomic City + ASN bundle"| GEO
     MAXMIND["MaxMind download service"] --> UPDATER
     OPS["Administrator"] -->|"deploy, monitor, rotate credentials"| GEO
 ```
 
-The client-facing API supports:
+API surface:
 
 ```text
 POST /v1/lookup
@@ -41,7 +33,7 @@ GET  /v1/me
 POST /v1/country
 ```
 
-`/v1/country` remains as a compatibility endpoint. New integrations should use `/v1/lookup` unless they need only the country name.
+`/v1/country` is retained for compatibility. New integrations should use `/v1/lookup` when they need network or approximate location metadata.
 
 ## 2. Physical placement
 
@@ -54,7 +46,7 @@ flowchart TB
     VM --> K3S["K3s single-node cluster"]
 ```
 
-This provides application-process recovery and orchestration inside the VM. It does not provide hardware high availability. A Proxmox host, VM, local network, or power failure can still make the entire service unavailable.
+Kubernetes can recover application processes inside the VM. It cannot recover from loss of the one VM, Proxmox host, storage, local network or power source.
 
 ## 3. Logical service topology
 
@@ -65,11 +57,11 @@ flowchart TB
     TUNNEL --> CFD["cloudflared Pod"]
     CFD --> SVC["Service: geotagger :8080"]
     SVC --> API["GeoTagger API Pods"]
+    HPA["HPA: 2 to 8 Pods"] --> API
 
-    HPA["HPA: 2 to 8 Pods, target 65% CPU request"] --> API
-
-    API --> CITY["GeoLite2 City MMDB"]
-    API --> ASN["GeoLite2 ASN MMDB"]
+    API --> CURRENT["MMDB current generation"]
+    CURRENT --> CITY["GeoLite2 City MMDB"]
+    CURRENT --> ASN["GeoLite2 ASN MMDB"]
 
     API -->|"durable publish"| NSVC["Service: nats :4222"]
     NSVC --> NATS["NATS JetStream"]
@@ -77,29 +69,26 @@ flowchart TB
     WORKER --> CSVC["Service: clickhouse :8123"]
     CSVC --> CH["ClickHouse audit store"]
 
-    CRON["MMDB update CronJob"] --> CITY
-    CRON --> ASN
+    CRON["MMDB update CronJob"] --> CURRENT
 ```
 
-ClickHouse is not in the synchronous response path. NATS JetStream is.
+ClickHouse is outside the synchronous request path. NATS JetStream is inside it because the API waits for durable audit acceptance.
 
 ## 4. Public ingress
 
-`cloudflared` establishes outbound connections to Cloudflare. The VM does not require a public origin IP or inbound NAT rule.
+`cloudflared` establishes outbound tunnel connections to Cloudflare. The VM does not require an inbound WAN port-forward or a public origin address.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant E as Cloudflare Edge
-    participant T as Cloudflare Tunnel
-    participant D as cloudflared Pod
-    participant S as geotagger Service
+    participant D as cloudflared
+    participant S as Kubernetes Service
     participant A as API Pod
     C->>E: HTTPS request
-    E->>T: route geo.itsjosiahdavis.dev
-    T->>D: tunnel transport
+    E->>D: Cloudflare Tunnel
     D->>S: HTTP :8080
-    S->>A: route to ready API Pod
+    S->>A: route to a ready Pod
     A-->>C: response through reverse path
 ```
 
@@ -109,8 +98,6 @@ Tunnel origin:
 http://geotagger.geotagger.svc.cluster.local:8080
 ```
 
-The Kubernetes Service name is stable even when Pod IPs or replica counts change.
-
 ## 5. Authentication boundary
 
 Clients authenticate with:
@@ -119,9 +106,7 @@ Clients authenticate with:
 Authorization: Bearer <key-id>.<secret>
 ```
 
-The server stores only SHA-256 digests of client secrets. Secret comparison is constant-time.
-
-Authentication happens before target-IP parsing. An unauthenticated request is audited as `unauthenticated`, but GeoTagger does not parse/store the requested target IP before authentication succeeds.
+The server stores only SHA-256 digests of client secrets and performs constant-time comparison. Authentication occurs before target-IP parsing, so failed authentication does not cause the requested target IP to be retained in the audit event.
 
 ## 6. Full lookup request path
 
@@ -136,25 +121,22 @@ sequenceDiagram
 
     C->>A: POST /v1/lookup + bearer token
     A->>A: generate X-Request-ID
-    A->>A: authenticate caller
-    A->>A: validate JSON and public IP policy
-    A->>CITY: local mmap lookup
+    A->>A: authenticate and validate public IP
+    A->>CITY: local mmap decode
     CITY-->>A: geography + matched prefix
-    A->>ASN: local mmap lookup
+    A->>ASN: local mmap decode
     ASN-->>A: ASN + organization + prefix
-    A->>A: build response and HMAC audit IP
+    A->>A: construct response + HMAC audit value
     A->>N: durable audit publish
     N-->>A: publish ACK
-    A-->>C: JSON intelligence response
+    A-->>C: rich JSON response
 ```
 
-The City and ASN readers are local memory-mapped files. There is no network lookup between the API and either database.
+Both MMDB readers are local memory-mapped files. No HTTP call is made during the lookup.
 
-## 7. `/v1/me` path
+## 7. `/v1/me` trust boundary
 
-`GET /v1/me` uses the observed caller IP rather than an explicit request body.
-
-Preference order:
+`GET /v1/me` resolves the caller address observed at ingress. Current precedence is:
 
 ```text
 CF-Connecting-IP
@@ -162,26 +144,18 @@ first X-Forwarded-For entry
 RemoteAddr for trusted internal/direct testing
 ```
 
-This is safe only while the origin remains restricted to the intended Cloudflare Tunnel/internal trust boundary. If an untrusted client can connect directly to the origin, forwarded headers must not be trusted without a stronger trusted-proxy check.
+The API origin must therefore remain restricted to the intended Cloudflare Tunnel/internal path. If direct untrusted origin access is introduced later, forwarded headers must be accepted only from explicitly trusted proxy peers.
 
-```mermaid
-flowchart LR
-    CLIENT["Caller"] --> CF["Cloudflare"]
-    CF -->|"CF-Connecting-IP"| API["GeoTagger API"]
-    API --> CITY["City MMDB"]
-    API --> ASN["ASN MMDB"]
-```
+## 8. Rich response model
 
-## 8. Rich response data model
-
-The rich lookup response can include:
+The response can include:
 
 ```text
 normalized IP
 matched network/CIDR
-continent code/name
-country code/name
-region/subdivision code/name
+continent
+country
+region/subdivision
 city
 postal code
 estimated latitude/longitude
@@ -197,33 +171,31 @@ local lookup latency
 request ID
 ```
 
-Missing data is not fabricated.
+City, region and coordinates are IP-geolocation estimates, not GPS. Missing data is not fabricated. Consumers should use `accuracy_radius_km` when precision matters.
 
-City/region/coordinate values are IP-geolocation estimates. They are not GPS location. `accuracy_radius_km` is returned specifically so downstream systems can represent uncertainty.
+## 9. Data minimization
 
-## 9. Data-minimization boundary
+Rich response fields are returned to the authenticated caller but are not copied wholesale into ClickHouse.
 
-The rich response is not copied wholesale into ClickHouse.
-
-The durable audit event remains intentionally smaller:
+The durable audit record remains:
 
 ```text
 timestamp
 request ID
 caller ID
-HMAC/raw/omitted IP representation according to policy
+HMAC/raw/omitted IP representation
 country code/name
 outcome
 HTTP status
 lookup latency
-combined City/ASN database version metadata
+combined City/ASN source version metadata
 ```
 
-This keeps city, coordinates, postal code, timezone and ASN out of the retained audit schema unless a future requirement explicitly justifies storing them.
+This keeps city, postal code, coordinates, timezone and ASN out of durable audit storage unless a future requirement explicitly justifies them.
 
 ## 10. Audit durability
 
-JetStream configuration:
+Production JetStream policy:
 
 ```text
 Retention: WorkQueue
@@ -234,40 +206,77 @@ Discard:   DiscardNew
 
 ```mermaid
 flowchart LR
-    API["API needs durable audit acceptance"] --> PUB["Publish audit event"]
+    API["API requires audit acceptance"] --> PUB["Publish event"]
     PUB -->|"accepted"| ACK["JetStream ACK"]
     ACK --> OK["return normal response"]
     PUB -->|"unavailable or full"| FAIL["publish failure"]
     FAIL --> ERR["return 503"]
 ```
 
-The service deliberately fails closed when required durable audit acceptance is unavailable.
+The service fails closed when the required durable audit event cannot be accepted.
 
 ## 11. Audit persistence
 
 ```mermaid
 sequenceDiagram
-    autonumber
     participant N as NATS JetStream
     participant W as Audit worker
     participant C as ClickHouse
-    N->>W: deliver message
+    N->>W: deliver audit message
     W->>W: accumulate batch
-    W->>C: batched JSONEachRow INSERT
+    W->>C: JSONEachRow batch insert
     alt insert succeeds
-        C-->>W: success
         W->>N: ACK
     else insert fails
-        C-->>W: error
         W->>N: NAK / redelivery
     end
 ```
 
-Delivery is at least once. A worker crash after ClickHouse accepts a row but before the NATS ACK can produce a duplicate. `request_id` is the correlation/deduplication key when uniqueness matters.
+Delivery is at least once. A crash after ClickHouse accepts an insert but before NATS receives the ACK can produce a duplicate; `request_id` is the correlation/deduplication key.
 
-## 12. MMDB update architecture
+## 12. Atomic MMDB generation model
 
-The updater now manages City and ASN together using the same MaxMind license key.
+Production no longer replaces City and ASN independently. The updater publishes a **bundle generation** and atomically switches one `current` symlink.
+
+Filesystem layout:
+
+```text
+/var/lib/geotagger/mmdb/
+├── current -> releases/release-20260914T.../
+└── releases/
+    ├── release-.../
+    ├── release-.../
+    └── release-.../
+        ├── GeoLite2-City.mmdb
+        └── GeoLite2-ASN.mmdb
+```
+
+Updater flow:
+
+```mermaid
+flowchart LR
+    CRON["CronJob 03:17 daily"] --> JOB["Updater Job"]
+    JOB --> CITYDL["Download City"]
+    JOB --> ASNDL["Download ASN"]
+    CITYDL --> STAGE["Versioned staging directory"]
+    ASNDL --> STAGE
+    STAGE --> VERIFY["fsync + verify every MMDB"]
+    VERIFY --> RELEASE["Publish complete release directory"]
+    RELEASE --> LINK["Atomic current symlink swap"]
+    LINK --> API["API hot reload"]
+```
+
+Guarantee:
+
+```text
+readers see old complete generation
+OR
+readers see new complete generation
+```
+
+They do not see a City database from one update paired with an ASN database from another because activation occurs through one atomic symlink rename.
+
+The updater keeps the three newest complete releases so an operator has short rollback/forensics headroom without unbounded disk growth.
 
 Default updater configuration:
 
@@ -276,67 +285,38 @@ MAXMIND_EDITIONS=GeoLite2-City,GeoLite2-ASN
 MMDB_DIR=/data
 ```
 
-```mermaid
-flowchart LR
-    CRON["CronJob 03:17 daily"] --> JOB["Updater Job"]
-    JOB --> CITYDL["Download City archive"]
-    JOB --> ASNDL["Download ASN archive"]
-    CITYDL --> CITYTMP["Stage City MMDB"]
-    ASNDL --> ASNTMP["Stage ASN MMDB"]
-    CITYTMP --> VERIFY["Verify all staged databases"]
-    ASNTMP --> VERIFY
-    VERIFY --> CITYREN["Atomic rename City"]
-    VERIFY --> ASNREN["Atomic rename ASN"]
-    CITYREN --> DIR["/var/lib/geotagger/mmdb"]
-    ASNREN --> DIR
-    DIR --> API["API hot reload"]
-```
+The same `MAXMIND_LICENSE_KEY` downloads both editions.
 
-Important update semantics:
+## 13. Bootstrap and hot reload
 
-- every configured database must download successfully before live replacement begins;
-- every staged MMDB is opened and verified before replacement;
-- each file replacement uses an atomic rename;
-- a process/host crash between the two final renames can briefly leave different City/ASN build timestamps;
-- the API tolerates this and reports each database's source version independently;
-- API Pods periodically check both files and reopen changed readers without restart.
-
-The CronJob uses:
-
-```text
-concurrencyPolicy: Forbid
-```
-
-so two scheduled update Jobs do not overlap.
-
-## 13. Bootstrap path
-
-Deployment runs a one-time bootstrap Job before rolling out the API.
+Deployment creates a bootstrap Job before rolling out API Pods.
 
 ```mermaid
 sequenceDiagram
     participant D as deploy-k3s.sh
-    participant J as MMDB bootstrap Job
+    participant J as Bootstrap Job
     participant M as MaxMind
-    participant F as local MMDB directory
+    participant F as MMDB directory
     participant A as API Deployment
-    D->>J: create bootstrap Job
+    D->>J: start bootstrap
     J->>M: download City + ASN
-    J->>J: verify both databases
-    J->>F: atomic file replacements
+    J->>J: verify complete generation
+    J->>F: atomic current switch
     J-->>D: complete
-    D->>A: apply/rollout API
-    A->>F: wait for both MMDB files
+    D->>A: roll out API
+    A->>F: wait for current City + ASN
 ```
 
-The API init container waits until both files are present and non-empty:
+API paths:
 
 ```text
-/data/GeoLite2-City.mmdb
-/data/GeoLite2-ASN.mmdb
+/data/current/GeoLite2-City.mmdb
+/data/current/GeoLite2-ASN.mmdb
 ```
 
-## 14. Kubernetes resource map
+The API checks file modification times periodically. When `current` switches to a new generation, the new files are opened and verified before the in-process readers are swapped. No Pod restart is required.
+
+## 14. Kubernetes resources
 
 ```mermaid
 flowchart TB
@@ -344,25 +324,17 @@ flowchart TB
     ADEP --> APODS["2 to 8 API Pods"]
     HPA["HorizontalPodAutoscaler"] --> ADEP
     ASVC["Service: geotagger"] --> APODS
-
-    NS --> WDEP["Deployment: geotagger-audit-worker"]
-    WDEP --> WPOD["Worker Pod"]
-
+    NS --> WDEP["Deployment: audit worker"]
     NS --> NSET["StatefulSet: nats"]
-    NSET --> NPOD["nats-0"]
-    NPOD --> NPVC["NATS PVC"]
-
     NS --> CSET["StatefulSet: clickhouse"]
-    CSET --> CPOD["clickhouse-0"]
-    CPOD --> CPVC["ClickHouse PVC"]
-
     NS --> CFDEP["Deployment: cloudflared"]
-    NS --> CRON["CronJob: geotagger-mmdb-update"]
+    NS --> BOOT["Job: MMDB bootstrap"]
+    NS --> CRON["CronJob: MMDB update"]
 ```
 
-## 15. Health model
+## 15. Health and autoscaling
 
-API admin listener on port 9090:
+Internal admin listener on port 9090:
 
 ```text
 /healthz
@@ -370,21 +342,7 @@ API admin listener on port 9090:
 /metrics
 ```
 
-The public Kubernetes Service exposes only port 8080.
-
-```mermaid
-flowchart LR
-    START["Pod starts"] --> INIT["wait for City + ASN MMDBs"]
-    INIT --> LIVE["API process running"]
-    LIVE --> READY["ready when audit transport healthy"]
-    READY -->|"readiness fails"| UNREADY["removed from Service endpoints"]
-    UNREADY -->|"dependency recovers"| READY
-    LIVE -->|"liveness fails repeatedly"| RESTART["container restart"]
-```
-
-## 16. Autoscaling
-
-Current API HPA:
+Current API scaling:
 
 ```text
 minimum replicas: 2
@@ -395,34 +353,26 @@ CPU target:        65% of request
 scale-down window: 5 minutes
 ```
 
-```mermaid
-flowchart LR
-    METRICS["K3s Metrics Server"] --> HPA["HPA"]
-    HPA --> DEPLOY["API Deployment"]
-    DEPLOY --> PODS["2 to 8 API Pods"]
-    PODS --> SVC["geotagger Service"]
-```
+All API Pods still share one 9-vCPU VM. HPA can consume spare capacity but cannot create new hardware.
 
-All replicas share the same 9-vCPU VM. HPA can consume unused node capacity; it cannot create more physical CPU.
-
-## 17. Storage
+## 16. Storage
 
 ```mermaid
 flowchart TB
-    DATASTORE["Proxmox HDD-backed datastore"] --> VDISK["GeoTagger VM data disk"]
-    VDISK --> K3S["K3s persistent storage"]
-    K3S --> NPVC["NATS PVC"]
-    K3S --> CPVC["ClickHouse PVC"]
-    VDISK --> MMDBDIR["/var/lib/geotagger/mmdb"]
-    MMDBDIR --> CITY["GeoLite2-City.mmdb"]
-    MMDBDIR --> ASN["GeoLite2-ASN.mmdb"]
+    DS["Proxmox HDD-backed datastore"] --> VDISK["GeoTagger VM data disk"]
+    VDISK --> PVC1["NATS PVC"]
+    VDISK --> PVC2["ClickHouse PVC"]
+    VDISK --> MMDB["MMDB release generations"]
+    MMDB --> CURRENT["current symlink"]
+    CURRENT --> CITY["City MMDB"]
+    CURRENT --> ASN["ASN MMDB"]
 ```
 
-MMDB files are node-local read-only mounts inside API Pods. NATS and ClickHouse use persistent volumes.
+NATS and ClickHouse require persistent state. MMDB generations are reproducible from MaxMind but are kept locally for runtime availability and rollback.
 
-## 18. Network policy
+## 17. Network isolation
 
-Required ingress relationships:
+Allowed ingress relationships:
 
 ```text
 cloudflared -> API        TCP 8080
@@ -431,19 +381,11 @@ worker      -> NATS       TCP 4222
 worker      -> ClickHouse TCP 8123
 ```
 
-```mermaid
-flowchart LR
-    CFD["cloudflared"] -->|"8080"| API["API"]
-    API -->|"4222"| NATS["NATS"]
-    WORKER["worker"] -->|"4222"| NATS
-    WORKER -->|"8123"| CH["ClickHouse"]
-```
+NATS and ClickHouse are ClusterIP-only. The current policy is ingress-focused; a future egress-deny policy must preserve DNS, Cloudflare and MaxMind download requirements.
 
-NATS and ClickHouse are ClusterIP-only and are not intended to be reachable from the Internet or ordinary LAN clients.
+## 18. Secrets and runtime hardening
 
-## 19. Secrets
-
-Kubernetes Secret data includes:
+Kubernetes Secret values include:
 
 ```text
 API_KEYS
@@ -453,89 +395,39 @@ MAXMIND_LICENSE_KEY
 CLOUDFLARE_TUNNEL_TOKEN
 ```
 
-One MaxMind license key downloads both City and ASN editions.
+API/worker run as `65532:65532`; NATS runs as `1000:1000`. Application containers use non-root execution, disabled privilege escalation, dropped capabilities and read-only root filesystems where designed.
 
-The K3s deployment should use secrets encryption at rest, controlled administrator access, protected recovery copies and documented rotation/revocation procedures.
-
-## 20. Container hardening
-
-API/worker runtime identity:
-
-```text
-UID:GID 65532:65532
-```
-
-NATS runtime identity:
-
-```text
-UID:GID 1000:1000
-```
-
-Application hardening includes:
-
-```text
-runAsNonRoot: true
-allowPrivilegeEscalation: false
-readOnlyRootFilesystem: true where supported
-capabilities: drop ALL
-```
-
-## 21. Failure behavior
+## 19. Failure behavior
 
 | Failure | Effect | Recovery |
 |---|---|---|
-| API Pod crash | connection may fail | Deployment recreates Pod |
-| one API Pod unready | removed from Service | returns after readiness recovers |
-| City/ASN update download failure | current live files remain | next Job retries later |
-| one staged MMDB invalid | no live replacement begins | updater fails Job |
-| NATS unavailable | no durable audit ACK | API returns service failure |
-| worker unavailable | JetStream backlog grows | worker restarts and drains backlog |
-| ClickHouse unavailable | worker cannot persist/ACK | messages remain queued |
-| JetStream full | new audit event rejected | restore consumer/storage capacity |
+| API Pod crash | affected connection may fail | Deployment recreates Pod |
+| API unready | removed from Service | returns after dependency recovery |
+| one MMDB download/verification fails | new generation is never activated | existing `current` generation stays active |
+| process dies before `current` swap | existing generation remains active | next Job retries |
+| process dies after atomic `current` swap | new complete generation is active | API reloads it |
+| NATS unavailable/full | durable audit ACK unavailable | normal lookup fails closed |
+| worker unavailable | JetStream backlog grows | worker restarts and drains |
+| ClickHouse unavailable | audit inserts/ACKs stop | JetStream retains work |
 | cloudflared unavailable | public endpoint unavailable | Deployment restarts connector |
-| VM/host unavailable | entire service unavailable | infrastructure recovery required |
+| VM/host unavailable | entire cluster unavailable | infrastructure recovery required |
 
-## 22. Performance boundary
+## 20. Performance boundary
 
-The original benchmark measured the country-only path. The rich endpoint now performs two MMDB decodes and serializes a larger response.
-
-Expected cost model:
+The historical benchmark measured the old country-only path. The rich endpoint adds a second MMDB decode and larger JSON response.
 
 ```text
-public request latency
+rich public latency
 = Cloudflare/network RTT
-+ authentication/validation
++ auth/validation
 + City MMDB decode
 + ASN MMDB decode
-+ durable JetStream publish ACK
++ durable JetStream ACK
 + JSON serialization
 ```
 
-The old 56-microsecond observation was a single country lookup and should not be presented as the measured rich-lookup latency.
+Use `test/load/k6-rich.js` from an external load generator before publishing capacity claims for `/v1/lookup`. Redis remains intentionally absent until measurements show local MMDB decode work is a material bottleneck.
 
-A new external-generator test should measure:
+## 21. Availability boundary
 
-```text
-POST /v1/country
-POST /v1/lookup
-GET  /v1/lookup?ip=...
-GET  /v1/me
-```
-
-and compare origin-side metrics with public-path latency.
-
-Redis is not part of the architecture because both lookup datasets are already local memory-mapped files. Add caching only if the new benchmark shows City/ASN decode work is a material bottleneck.
-
-## 23. Availability boundary
-
-Kubernetes improves process recovery, deployment behavior and horizontal use of spare CPU, but the current design still has one:
-
-```text
-physical host
-VM
-K3s node
-NATS instance
-ClickHouse instance
-```
-
-True high availability would require multiple failure domains and replicated state, not merely more API Pods.
+The current deployment still contains one physical host, one VM, one K3s node, one NATS instance and one ClickHouse instance. Multiple API Pods improve process resilience and CPU utilization; they do not provide full infrastructure HA.
