@@ -53,8 +53,8 @@ func TestAuditPipeline(t *testing.T) {
 	defer cancel()
 
 	// Exercise startup reconciliation instead of testing only a brand-new stream.
-	// This models an older deployment whose stream contract drifted before the
-	// API starts against it.
+	// This models an older deployment whose stream has the correct structural
+	// durability contract but stale mutable limits/settings.
 	prepareStaleAuditStream(t, natsURL)
 
 	publisher, err := natsaudit.NewNATSPublisher(natsURL, integrationStream, integrationSubject)
@@ -146,6 +146,38 @@ func TestPublisherRejectsMemoryBackedAuditStream(t *testing.T) {
 	}
 }
 
+func TestPublisherRejectsWrongRetentionPolicy(t *testing.T) {
+	natsURL := getenv("INTEGRATION_NATS_URL", "nats://127.0.0.1:4222")
+	const stream = "GEOTAGGER_AUDIT_LIMITS_INTEGRATION"
+	const subject = "geotagger.audit.limits.integration"
+
+	nc, err := nats.Connect(natsURL, nats.Timeout(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = js.DeleteStream(stream)
+	if _, err := js.AddStream(&nats.StreamConfig{
+		Name: stream, Subjects: []string{subject}, Storage: nats.FileStorage,
+		Retention: nats.LimitsPolicy, MaxBytes: 8 << 30, Discard: nats.DiscardNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer js.DeleteStream(stream) //nolint:errcheck
+
+	publisher, err := natsaudit.NewNATSPublisher(natsURL, stream, subject)
+	if publisher != nil {
+		_ = publisher.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "WorkQueue retention is required") {
+		t.Fatalf("expected WorkQueue retention rejection, got %v", err)
+	}
+}
+
 func prepareStaleAuditStream(t *testing.T, natsURL string) {
 	t.Helper()
 	nc, err := nats.Connect(natsURL, nats.Timeout(2*time.Second))
@@ -162,7 +194,7 @@ func prepareStaleAuditStream(t *testing.T, natsURL string) {
 		Name:              integrationStream,
 		Subjects:          []string{integrationSubject + ".stale"},
 		Storage:           nats.FileStorage,
-		Retention:         nats.LimitsPolicy,
+		Retention:         nats.WorkQueuePolicy,
 		MaxConsumers:      5,
 		MaxMsgs:           100,
 		MaxMsgsPerSubject: 50,
@@ -226,7 +258,7 @@ func assertStreamSafety(t *testing.T, natsURL string) {
 
 func waitForClickHouse(t *testing.T, endpoint, user, password string) {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(20*time.Second)
 	for time.Now().Before(deadline) {
 		req, _ := http.NewRequest(http.MethodGet, strings.TrimRight(endpoint, "/")+"/ping", nil)
 		req.SetBasicAuth(user, password)
@@ -237,7 +269,7 @@ func waitForClickHouse(t *testing.T, endpoint, user, password string) {
 				return
 			}
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(250*time.Millisecond)
 	}
 	t.Fatal("ClickHouse did not become ready")
 }
