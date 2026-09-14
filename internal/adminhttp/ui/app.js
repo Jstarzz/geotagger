@@ -132,6 +132,14 @@ function dismissToken() {
   $("token-panel").classList.add("hidden");
 }
 
+function resultNotice(result, successMessage) {
+  if (result?.warning) {
+    showNotice(`${successMessage} Warning: ${result.warning}`, true);
+    return;
+  }
+  showNotice(successMessage);
+}
+
 async function loadSession() {
   const session = await request("/admin/api/session");
   $("session-email").textContent = session.email;
@@ -179,7 +187,7 @@ async function createKey(event) {
     showToken(result.token);
     event.currentTarget.reset();
     $("create-panel").classList.add("hidden");
-    showNotice(`Created ${result.key.id}. Copy the token before dismissing it.`);
+    resultNotice(result, `Created ${result.key.id}. Copy the token before dismissing it.`);
     await Promise.all([loadKeys(), loadStatus()]);
   } catch (error) {
     showNotice(error.message, true);
@@ -193,7 +201,7 @@ async function rotateKey(id) {
   try {
     const result = await request(`/admin/api/keys/${encodeURIComponent(id)}/rotate`, { method: "POST", body: "{}" });
     showToken(result.token);
-    showNotice(`Rotated ${id}. Distribute the replacement token now.`);
+    resultNotice(result, `Rotated ${id}. Distribute the replacement token now.`);
     await Promise.all([loadKeys(), loadStatus()]);
   } catch (error) {
     showNotice(error.message, true);
@@ -206,11 +214,11 @@ async function revokeKey(id) {
   const reason = window.prompt(`Revoke ${id}? Optional revocation reason:`, "") ?? null;
   if (reason === null) return;
   try {
-    await request(`/admin/api/keys/${encodeURIComponent(id)}/revoke`, {
+    const result = await request(`/admin/api/keys/${encodeURIComponent(id)}/revoke`, {
       method: "POST",
       body: JSON.stringify({ reason: reason.trim() }),
     });
-    showNotice(`Revoked ${id}.`);
+    resultNotice(result, `Revoked ${id}.`);
     await Promise.all([loadKeys(), loadStatus()]);
   } catch (error) {
     showNotice(error.message, true);
