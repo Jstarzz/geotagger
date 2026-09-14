@@ -28,9 +28,9 @@ func main() {
 		logger.Error("invalid API key configuration", "error", err)
 		os.Exit(1)
 	}
-	lookup, err := maxmindgeo.OpenMaxMind(cfg.MMDBPath)
+	lookup, err := maxmindgeo.OpenMaxMind(cfg.CityMMDBPath, cfg.ASNMMDBPath)
 	if err != nil {
-		logger.Error("open MaxMind database", "error", err)
+		logger.Error("open MaxMind databases", "error", err)
 		os.Exit(1)
 	}
 	defer lookup.Close()
@@ -44,7 +44,7 @@ func main() {
 	stopReload := make(chan struct{})
 	go lookup.Watch(cfg.MMDBReload, stopReload,
 		func(err error) { logger.Error("MMDB reload failed", "error", err) },
-		func(version string) { logger.Info("MMDB reloaded", "version", version) },
+		func(version string) { logger.Info("MMDBs reloaded", "version", version) },
 	)
 	defer close(stopReload)
 
