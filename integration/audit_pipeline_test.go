@@ -52,6 +52,11 @@ func TestAuditPipeline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
+	// Exercise startup reconciliation instead of testing only a brand-new stream.
+	// This models an older deployment whose stream contract drifted before the
+	// API starts against it.
+	prepareStaleAuditStream(t, natsURL)
+
 	publisher, err := natsaudit.NewNATSPublisher(natsURL, integrationStream, integrationSubject)
 	if err != nil {
 		t.Fatalf("publisher: %v", err)
@@ -109,6 +114,68 @@ func TestAuditPipeline(t *testing.T) {
 	t.Fatal("audit event was not persisted in ClickHouse")
 }
 
+func TestPublisherRejectsMemoryBackedAuditStream(t *testing.T) {
+	natsURL := getenv("INTEGRATION_NATS_URL", "nats://127.0.0.1:4222")
+	const stream = "GEOTAGGER_AUDIT_MEMORY_INTEGRATION"
+	const subject = "geotagger.audit.memory.integration"
+
+	nc, err := nats.Connect(natsURL, nats.Timeout(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = js.DeleteStream(stream)
+	if _, err := js.AddStream(&nats.StreamConfig{
+		Name: stream, Subjects: []string{subject}, Storage: nats.MemoryStorage,
+		Retention: nats.WorkQueuePolicy, MaxBytes: 8 << 30, Discard: nats.DiscardNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer js.DeleteStream(stream) //nolint:errcheck
+
+	publisher, err := natsaudit.NewNATSPublisher(natsURL, stream, subject)
+	if publisher != nil {
+		_ = publisher.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "file storage is required") {
+		t.Fatalf("expected file-storage durability rejection, got %v", err)
+	}
+}
+
+func prepareStaleAuditStream(t *testing.T, natsURL string) {
+	t.Helper()
+	nc, err := nats.Connect(natsURL, nats.Timeout(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = js.DeleteStream(integrationStream)
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:              integrationStream,
+		Subjects:          []string{integrationSubject + ".stale"},
+		Storage:           nats.FileStorage,
+		Retention:         nats.LimitsPolicy,
+		MaxConsumers:      5,
+		MaxMsgs:           100,
+		MaxMsgsPerSubject: 50,
+		MaxBytes:          1 << 20,
+		MaxAge:            7 * 24 * time.Hour,
+		Discard:           nats.DiscardOld,
+		NoAck:             true,
+	})
+	if err != nil {
+		t.Fatalf("create stale audit stream: %v", err)
+	}
+}
+
 func assertStreamSafety(t *testing.T, natsURL string) {
 	t.Helper()
 	nc, err := nats.Connect(natsURL, nats.Timeout(2*time.Second))
@@ -124,17 +191,36 @@ func assertStreamSafety(t *testing.T, natsURL string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Config.MaxBytes != 8<<30 {
-		t.Fatalf("MaxBytes=%d want=%d", info.Config.MaxBytes, int64(8<<30))
+	cfg := info.Config
+	if cfg.Storage != nats.FileStorage {
+		t.Fatalf("Storage=%v want FileStorage", cfg.Storage)
 	}
-	if info.Config.MaxAge != 0 {
-		t.Fatalf("MaxAge=%s want=0", info.Config.MaxAge)
+	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != integrationSubject {
+		t.Fatalf("Subjects=%v want=[%s]", cfg.Subjects, integrationSubject)
 	}
-	if info.Config.Discard != nats.DiscardNew {
-		t.Fatalf("Discard=%v want DiscardNew", info.Config.Discard)
+	if cfg.Retention != nats.WorkQueuePolicy {
+		t.Fatalf("Retention=%v want WorkQueuePolicy", cfg.Retention)
 	}
-	if info.Config.Retention != nats.WorkQueuePolicy {
-		t.Fatalf("Retention=%v want WorkQueuePolicy", info.Config.Retention)
+	if cfg.MaxConsumers != -1 {
+		t.Fatalf("MaxConsumers=%d want=-1", cfg.MaxConsumers)
+	}
+	if cfg.MaxMsgs != -1 {
+		t.Fatalf("MaxMsgs=%d want=-1", cfg.MaxMsgs)
+	}
+	if cfg.MaxMsgsPerSubject != -1 {
+		t.Fatalf("MaxMsgsPerSubject=%d want=-1", cfg.MaxMsgsPerSubject)
+	}
+	if cfg.MaxBytes != 8<<30 {
+		t.Fatalf("MaxBytes=%d want=%d", cfg.MaxBytes, int64(8<<30))
+	}
+	if cfg.MaxAge != 0 {
+		t.Fatalf("MaxAge=%s want=0", cfg.MaxAge)
+	}
+	if cfg.Discard != nats.DiscardNew {
+		t.Fatalf("Discard=%v want DiscardNew", cfg.Discard)
+	}
+	if cfg.NoAck {
+		t.Fatal("NoAck=true want=false")
 	}
 }
 
