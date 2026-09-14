@@ -4,6 +4,8 @@ This directory is the technical and operational handoff for the deployed GeoTagg
 
 ## Core system documentation
 
+- [Client Quickstart](CLIENT_QUICKSTART.md) — Yaak and cURL setup, authentication header, test addresses and end-to-end audit verification.
+- [`openapi.yaml`](../openapi.yaml) — machine-readable OpenAPI 3.1 contract suitable for importing into Yaak, Postman and other API clients.
 - [Project Overview](PROJECT_OVERVIEW.md) — purpose, design goals, component responsibilities, trust boundaries, request lifecycle, scaling and operational acceptance.
 - [Production Architecture](ARCHITECTURE.md) — physical placement, Cloudflare ingress, Kubernetes topology, synchronous lookup, durable audit pipeline, storage, networking, scaling and failure recovery.
 - [Kubernetes / K3s Guide](KUBERNETES.md) — Pods versus containers, containerd, Deployments, StatefulSets, Services, HPA, PVCs, probes, CronJobs, NetworkPolicy, Secrets and operating commands.
