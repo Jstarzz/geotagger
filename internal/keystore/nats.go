@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Jstarzz/geotagger/internal/auth"
@@ -45,8 +46,10 @@ type CreateInput struct {
 }
 
 type Store struct {
-	nc *nats.Conn
-	kv nats.KeyValue
+	nc          *nats.Conn
+	kv          nats.KeyValue
+	syncStarted atomic.Bool
+	syncHealthy atomic.Bool
 }
 
 func Open(url, bucket string) (*Store, error) {
@@ -95,7 +98,10 @@ func Open(url, bucket string) (*Store, error) {
 }
 
 func (s *Store) Healthy() bool {
-	return s != nil && s.nc != nil && s.nc.IsConnected()
+	if s == nil || s.nc == nil || !s.nc.IsConnected() {
+		return false
+	}
+	return !s.syncStarted.Load() || s.syncHealthy.Load()
 }
 
 func (s *Store) Close() error {
@@ -235,13 +241,18 @@ func (s *Store) StartVerifierSync(ctx context.Context, verifier *auth.Verifier, 
 	if err != nil {
 		return nil, fmt.Errorf("watch managed keys: %w", err)
 	}
+	s.syncStarted.Store(true)
+	s.syncHealthy.Store(false)
 	ready := make(chan error, 1)
 	go func() {
 		defer watcher.Stop() //nolint:errcheck
 		defer close(ready)
+		defer s.syncHealthy.Store(false)
 		state := make(map[string]Record)
 		initialized := false
 		readySent := false
+		updates := watcher.Updates()
+		watchErrors := watcher.Error()
 		apply := func() error {
 			keys := make([]auth.ManagedKey, 0, len(state))
 			for _, record := range state {
@@ -250,7 +261,12 @@ func (s *Store) StartVerifierSync(ctx context.Context, verifier *auth.Verifier, 
 					ExpiresAt: record.ExpiresAt, RevokedAt: record.RevokedAt,
 				})
 			}
-			return verifier.ReplaceManaged(keys)
+			if err := verifier.ReplaceManaged(keys); err != nil {
+				s.syncHealthy.Store(false)
+				return err
+			}
+			s.syncHealthy.Store(true)
+			return nil
 		}
 		report := func(err error) {
 			if onError != nil {
@@ -264,19 +280,26 @@ func (s *Store) StartVerifierSync(ctx context.Context, verifier *auth.Verifier, 
 					ready <- ctx.Err()
 				}
 				return
-			case err, ok := <-watcher.Error():
-				if ok && err != nil {
+			case err, ok := <-watchErrors:
+				if !ok {
+					watchErrors = nil
+					continue
+				}
+				if err != nil {
 					if !readySent {
 						ready <- err
 						readySent = true
 						return
 					}
+					s.syncHealthy.Store(false)
 					report(fmt.Errorf("managed key watch: %w", err))
 				}
-			case entry, ok := <-watcher.Updates():
+			case entry, ok := <-updates:
 				if !ok {
 					if !readySent {
 						ready <- errors.New("managed key watch closed before initial snapshot")
+					} else {
+						report(errors.New("managed key watch closed"))
 					}
 					return
 				}
@@ -297,6 +320,7 @@ func (s *Store) StartVerifierSync(ctx context.Context, verifier *auth.Verifier, 
 				} else {
 					record, err := decodeEntry(entry)
 					if err != nil {
+						s.syncHealthy.Store(false)
 						if !readySent {
 							ready <- err
 							readySent = true
