@@ -64,10 +64,15 @@ jobs:
 
   validate-deploy:
     runs-on: ubuntu-latest
+    env:
+      REDOCLY_TELEMETRY: off
+      REDOCLY_SUPPRESS_UPDATE_NOTICE: 'true'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Render K3s manifests
         run: kubectl kustomize deploy/k3s > /tmp/geotagger-manifests.yaml
+      - name: Validate OpenAPI contract
+        run: npx --yes @redocly/cli@2.52.1 lint openapi.yaml
       - name: Verify pinned ClickHouse LTS image exists and starts
         run: docker run --rm --entrypoint clickhouse clickhouse/clickhouse-server:26.3.33.24-alpine@sha256:67e3716310e54050a7164b1f535c81e59c397654b158aa50b488218cbdc77144 --version
 
