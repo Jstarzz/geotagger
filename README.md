@@ -8,7 +8,7 @@ Production endpoint:
 https://geo.itsjosiahdavis.dev
 ```
 
-Normal lookups do not call MaxMind, IPinfo, or another third-party geolocation API. City and ASN databases are downloaded on a schedule, verified, stored locally and memory-mapped by the API Pods.
+Normal lookups do not call MaxMind, IPinfo, or another third-party geolocation API. City and ASN databases are downloaded on a schedule, verified, activated as one local database generation and memory-mapped by the API Pods.
 
 ## Documentation
 
@@ -19,9 +19,10 @@ Start with:
 - [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md) — service purpose and components
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — production architecture and diagrams
 - [`docs/KUBERNETES.md`](docs/KUBERNETES.md) — K3s/Kubernetes resource model and operations
-- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — measured baseline load-test results
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — measured baseline load-test results and rich-endpoint benchmark plan
 - [`docs/PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md) — applied tuning, Redis/cache decision and scaling roadmap
 - [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md) — security review and remediation priorities
+- [`docs/DATA_CLASSIFICATION.md`](docs/DATA_CLASSIFICATION.md) — treatment of IP, location, ASN and audit data
 - [`docs/HIPAA_READINESS.md`](docs/HIPAA_READINESS.md) — pre-ePHI control matrix and compliance gate
 - [`docs/MFA_AND_IDENTITY.md`](docs/MFA_AND_IDENTITY.md) — machine identity and privileged-human MFA policy
 - [`CHANGELOG.md`](CHANGELOG.md) — notable changes
@@ -178,9 +179,24 @@ GeoLite2-City.mmdb
 GeoLite2-ASN.mmdb
 ```
 
-The same existing `MAXMIND_LICENSE_KEY` is used to download both. No second MaxMind/API key is required.
+The same existing `MAXMIND_LICENSE_KEY` downloads both. No second MaxMind/API key is required.
 
-The updater downloads and verifies all configured editions before replacing live files. Each final database replacement is an atomic rename. The API watches both files and safely reopens a changed reader without restarting the Pod.
+Production bundle layout:
+
+```text
+/var/lib/geotagger/mmdb/
+├── current -> releases/release-<generation>/
+└── releases/
+    ├── release-<older>/
+    ├── release-<previous>/
+    └── release-<current>/
+        ├── GeoLite2-City.mmdb
+        └── GeoLite2-ASN.mmdb
+```
+
+The updater downloads and verifies every configured edition inside a new release directory. Only after the complete bundle passes verification does it atomically replace the single `current` symlink. API Pods therefore see the old complete City+ASN generation or the new complete generation, not a half-updated pair. The updater retains the three newest complete releases for short rollback/forensics headroom.
+
+The API reads through `/data/current/...`, notices the new file generation on its periodic reload check, verifies the replacement readers and swaps them without restarting the Pod.
 
 ## Security model
 
@@ -257,7 +273,7 @@ The first public-path load test was performed on the earlier country-only lookup
 
 CPU contention appeared before disk saturation. A verified single-MMDB country lookup took 56 microseconds.
 
-The new rich endpoint performs City + ASN decoding and emits a larger JSON response, so the old benchmark is a baseline, **not a measured capacity claim for `/v1/lookup`**. Re-run the external-generator benchmark after deploying this feature.
+The rich endpoint performs City + ASN decoding and emits a larger JSON response, so the old benchmark is a baseline, **not a measured capacity claim for `/v1/lookup`**. Re-run the external-generator benchmark after deploying this feature.
 
 Redis is still not recommended by default. Both datasets are local memory-mapped MMDBs; adding Redis would create another network hop and stateful dependency before evidence shows MMDB decode cost is a material bottleneck. See [`docs/PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md).
 
@@ -284,7 +300,7 @@ Cron schedule:
 17 3 * * *
 ```
 
-`concurrencyPolicy: Forbid` prevents overlapping update Jobs. Both databases are downloaded and verified before live replacement begins; each final rename is atomic. The API periodically checks both files and hot-reloads changed readers.
+`concurrencyPolicy: Forbid` prevents overlapping update Jobs. A complete City+ASN release is staged and verified first, then one atomic `current` symlink switch activates the new generation. The API periodically checks the files reached through `current` and hot-reloads changed readers.
 
 Required runtime secret:
 
@@ -302,8 +318,8 @@ API variables:
 |---|---:|---|
 | `HTTP_ADDR` | `:8080` | API listener |
 | `ADMIN_ADDR` | `:9090` | internal probes/metrics |
-| `CITY_MMDB_PATH` | `/data/GeoLite2-City.mmdb` | City database path |
-| `ASN_MMDB_PATH` | `/data/GeoLite2-ASN.mmdb` | ASN database path |
+| `CITY_MMDB_PATH` | `/data/current/GeoLite2-City.mmdb` | active City database path |
+| `ASN_MMDB_PATH` | `/data/current/GeoLite2-ASN.mmdb` | active ASN database path |
 | `MMDB_RELOAD_INTERVAL` | `5m` | update detection interval |
 | `API_KEYS` | required | `id:sha256hex` entries |
 | `NATS_URL` | `nats://nats:4222` | audit transport |
@@ -322,7 +338,7 @@ For a fresh K3s node:
 2. Verify Metrics Server works.
 3. Apply the `geotagger` namespace and a local, uncommitted production Secret.
 4. Configure the Cloudflare Tunnel public hostname to the internal Service.
-5. Deploy. The bootstrap Job downloads both City and ASN MMDBs before the API rollout.
+5. Deploy. The bootstrap Job downloads and atomically activates a complete City+ASN bundle before the API rollout.
 
 ```bash
 kubectl apply -f deploy/k3s/namespace.yaml
@@ -336,7 +352,8 @@ Verify:
 kubectl -n geotagger get pods,hpa,networkpolicy
 kubectl -n geotagger top pods
 kubectl -n geotagger get pvc
-ls -lh /var/lib/geotagger/mmdb/GeoLite2-{City,ASN}.mmdb
+readlink -f /var/lib/geotagger/mmdb/current
+ls -lh /var/lib/geotagger/mmdb/current/GeoLite2-{City,ASN}.mmdb
 ```
 
 End-to-end rich lookup:
@@ -353,7 +370,23 @@ A deployment is not considered validated until the returned `X-Request-ID` is al
 
 ## Load testing
 
-Run k6 from a machine other than the GeoTagger VM for capacity measurements. The current k6 scenario exercises the compatibility country endpoint; add a dedicated rich-response scenario before publishing capacity figures for `/v1/lookup`.
+Run k6 from a machine other than the GeoTagger VM for capacity measurements.
+
+Country compatibility path:
+
+```bash
+RPS=500 DURATION=60s BASE_URL=https://geo.itsjosiahdavis.dev API_TOKEN="$API_TOKEN" \
+  k6 run test/load/k6.js
+```
+
+Rich City+ASN path:
+
+```bash
+RPS=500 DURATION=60s BASE_URL=https://geo.itsjosiahdavis.dev API_TOKEN="$API_TOKEN" \
+  k6 run test/load/k6-rich.js
+```
+
+Publish capacity numbers for the rich endpoint only after the external rich test has been run.
 
 ## CI/CD
 
