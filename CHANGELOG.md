@@ -6,19 +6,35 @@ All notable GeoTagger changes are recorded here. Dates use UTC calendar dates. T
 
 ### Added
 
+- Full IP intelligence endpoint: `POST /v1/lookup`.
+- Query-string lookup endpoint: `GET /v1/lookup?ip=...`.
+- Caller self-lookup endpoint: `GET /v1/me`, using the Cloudflare-observed public client IP when available.
+- GeoLite2 City enrichment: continent, country, first subdivision/region, city, postal code, estimated latitude/longitude, accuracy radius and timezone.
+- GeoLite2 ASN enrichment: autonomous system number and organization.
+- Matched MMDB network prefix, IP-version/classification metadata, per-database source/build metadata, lookup latency and request ID in the rich response.
+- Multi-database MMDB updater with `MAXMIND_EDITIONS`/`MMDB_DIR` support.
+- Atomic MMDB **bundle generation** activation: City and ASN are staged and verified together, then one `current` symlink is atomically switched to the complete new release. The three newest complete releases are retained.
+- Backward-compatible single-edition updater mode through `MAXMIND_EDITION`/`MMDB_PATH` for custom deployments.
+- Dedicated `test/load/k6-rich.js` load scenario for the rich City+ASN endpoint.
 - Origin-side request-latency Prometheus histogram: `geotagger_request_latency_microseconds`.
 - Durable JetStream publish-latency histogram: `geotagger_audit_publish_latency_microseconds`.
 - HIPAA readiness/control matrix with an explicit pre-ePHI production gate.
-- Data-classification and handling policy.
+- Data-classification and handling policy, expanded for approximate location and ASN/network metadata.
 - Backup/recovery runbook and recovery evidence template.
 - Security incident-response runbook.
 - Performance tuning guide covering HPA behavior, caching/Redis decisions, benchmark methodology and future scaling options.
 
 ### Changed
 
+- Production geolocation data source changed from GeoLite2 Country to local GeoLite2 City + GeoLite2 ASN databases. No additional MaxMind license key is required.
+- API Pods now wait for `/data/current/GeoLite2-City.mmdb` and `/data/current/GeoLite2-ASN.mmdb` before starting.
+- API hot reload reads through the active `current` generation, independently reopens changed readers and reports both database build versions.
+- Daily MMDB bootstrap/update jobs now refresh City and ASN as one verified generation using the existing `MAXMIND_LICENSE_KEY`.
+- `/v1/country` remains backward compatible and derives the country from the City database.
+- Rich city/coordinate/ASN data is returned to the authenticated caller but is not added to the ClickHouse audit schema; the retained audit record remains country-level plus HMAC IP representation and database-version metadata.
 - API Deployment baseline increased from one to two replicas to reduce cold burst/rollout sensitivity.
 - API CPU request increased from `250m` to `750m` so the HPA's 65% utilization target reflects meaningful CPU pressure instead of scaling toward eight Pods at roughly 1.3 aggregate API cores.
-- k6 treats HTTP `404 country not found` as an expected application result for valid public fixture IPs, removing the historical ~25% false failure baseline caused by GeoLite2 snapshot coverage.
+- k6 treats legitimate GeoLite2 `404` lookup outcomes as expected application results instead of transport/service failures.
 - Audit worker reuses its batch row slice between flushes.
 - ClickHouse batch writer pre-sizes the NDJSON buffer to reduce repeated allocations/copies.
 - Kubernetes and architecture documentation Mermaid diagrams were rewritten with GitHub-safe quoted labels, including filesystem paths.
@@ -26,9 +42,12 @@ All notable GeoTagger changes are recorded here. Dates use UTC calendar dates. T
 
 ### Security / Compliance
 
+- Clarified that `/v1/me` trusts Cloudflare forwarding metadata only within the intended Tunnel/internal origin boundary; the origin should not be exposed directly to untrusted clients.
+- IP-derived city/region/coordinates are explicitly documented as estimates, not GPS/device location; clients should use `accuracy_radius_km` and avoid representing the result as precise physical location.
+- Rich geolocation/network response data remains transient by default rather than being copied into durable audit storage.
 - Clarified that GeoTagger's public API is machine-to-machine and does not require interactive MFA on every API call.
-- Added an administrative MFA policy: human access to Cloudflare, GitHub, Proxmox, Kubernetes administration, backup/secret systems and any future human admin UI should use MFA where supported and required by the organization's risk-management policy.
-- Documented that the currently effective HIPAA Security Rule requires appropriate person/entity authentication; the HHS Security Rule modernization proposal would require MFA with limited exceptions. GeoTagger adopts MFA for privileged human administration as a forward-looking baseline without claiming the proposal is already final law.
+- Added an administrative MFA policy for privileged human access to Cloudflare, GitHub, Proxmox, Kubernetes administration, backup/secret systems and any future human admin UI.
+- Documented the current HIPAA Security Rule versus the proposed stronger MFA requirements without claiming that a proposed rule is already final law.
 
 ## [2026-09-12]
 

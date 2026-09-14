@@ -25,7 +25,7 @@ spec:
       initContainers:
         - name: wait-for-mmdb
           image: busybox:1.37.0
-          command: ["sh", "-c", "until [ -s /data/GeoLite2-Country.mmdb ]; do sleep 1; done"]
+          command: ["sh", "-c", "until [ -s /data/current/GeoLite2-City.mmdb ] && [ -s /data/current/GeoLite2-ASN.mmdb ]; do sleep 1; done"]
           securityContext:
             runAsUser: 65532
             runAsGroup: 65532
@@ -40,7 +40,8 @@ spec:
             - {name: http, containerPort: 8080}
             - {name: admin, containerPort: 9090}
           env:
-            - {name: MMDB_PATH, value: /data/GeoLite2-Country.mmdb}
+            - {name: CITY_MMDB_PATH, value: /data/current/GeoLite2-City.mmdb}
+            - {name: ASN_MMDB_PATH, value: /data/current/GeoLite2-ASN.mmdb}
             - {name: NATS_URL, value: nats://nats:4222}
             - {name: AUDIT_IP_MODE, value: hmac}
             - name: API_KEYS
@@ -59,10 +60,8 @@ spec:
             failureThreshold: 6
           resources:
             # HPA CPU utilization is calculated against requests, not limits.
-            # 250m made the 65% target equal only 162.5m per Pod and caused
-            # aggressive over-scaling on the 9-vCPU single-node deployment.
-            # 750m keeps headroom for NATS/ClickHouse/worker while making the
-            # scaling signal better match actual CPU pressure.
+            # 750m keeps the autoscaling signal aligned with meaningful CPU
+            # pressure on the 9-vCPU single-node deployment.
             requests: {cpu: 750m, memory: 64Mi}
             limits: {cpu: "2", memory: 256Mi}
           securityContext:

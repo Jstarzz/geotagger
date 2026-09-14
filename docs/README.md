@@ -7,10 +7,38 @@ This directory is the technical and operational handoff for the deployed GeoTagg
 - [Project Overview](PROJECT_OVERVIEW.md) — purpose, design goals, component responsibilities, trust boundaries, request lifecycle, scaling and operational acceptance.
 - [Production Architecture](ARCHITECTURE.md) — physical placement, Cloudflare ingress, Kubernetes topology, synchronous lookup, durable audit pipeline, storage, networking, scaling and failure recovery.
 - [Kubernetes / K3s Guide](KUBERNETES.md) — Pods versus containers, containerd, Deployments, StatefulSets, Services, HPA, PVCs, probes, CronJobs, NetworkPolicy, Secrets and operating commands.
-- [API Guide](API.md) — authentication, request/response contract, errors, retry behavior, IPv4/IPv6 and audit correlation.
+- [API Guide](API.md) — full City/ASN intelligence API, `/v1/me`, backward-compatible country lookup, authentication, response fields, errors, IPv4/IPv6 and audit correlation.
 - [Performance and Capacity](PERFORMANCE.md) — measured public-path load test, bottleneck analysis and benchmark limitations.
-- [Performance Tuning Guide](PERFORMANCE_TUNING.md) — HPA tuning, Redis/cache decision, new latency metrics, load-test methodology and prioritized scaling options.
-- [Project Changelog](../CHANGELOG.md) — notable repository, deployment-hardening and documentation changes.
+- [Performance Tuning Guide](PERFORMANCE_TUNING.md) — HPA tuning, Redis/cache decision, latency metrics, load-test methodology and prioritized scaling options.
+- [Project Changelog](../CHANGELOG.md) — notable repository, deployment-hardening, API and documentation changes.
+
+## Current lookup data path
+
+```mermaid
+flowchart LR
+    CLIENT["Machine client"] -->|"HTTPS"| CF["Cloudflare"]
+    CF --> CFD["cloudflared"]
+    CFD --> SVC["Kubernetes Service"]
+    SVC --> API["GeoTagger API Pods"]
+    API --> CITY["GeoLite2 City MMDB"]
+    API --> ASN["GeoLite2 ASN MMDB"]
+    API -->|"durable publish"| NATS["NATS JetStream"]
+    NATS --> WORKER["Audit worker"]
+    WORKER --> CH["ClickHouse"]
+```
+
+The public API now supports:
+
+```text
+POST /v1/lookup       full City + ASN intelligence
+GET  /v1/lookup?ip=  full lookup using a query parameter
+GET  /v1/me           full lookup for the observed caller IP
+POST /v1/country      backward-compatible country-only response
+```
+
+The City and ASN databases are downloaded locally with the existing MaxMind license key, verified before activation, memory-mapped by API Pods and hot-reloaded after scheduled refreshes. Normal lookups still do not call a third-party geolocation API.
+
+The deployed cluster is a single K3s node inside a dedicated Proxmox VM. Kubernetes provides workload reconciliation, readiness-aware routing, API autoscaling, scheduled MMDB updates, internal service discovery, persistent volumes and network policy. It does not provide hardware high availability for the single VM/host.
 
 ## Security, privacy and compliance operations
 
@@ -21,21 +49,11 @@ This directory is the technical and operational handoff for the deployed GeoTagg
 - [Backup and Recovery Runbook](BACKUP_RECOVERY.md) — backup scope, independent failure-domain requirement, restore procedure and recovery evidence.
 - [Security Incident Response Runbook](INCIDENT_RESPONSE.md) — containment, evidence preservation, credential rotation, recovery and post-incident review.
 
-## Architecture at a glance
+## Location-data interpretation
 
-```mermaid
-flowchart LR
-    CLIENT["Machine client"] -->|"HTTPS"| CF["Cloudflare"]
-    CF --> CFD["cloudflared"]
-    CFD --> SVC["Kubernetes Service"]
-    SVC --> API["GeoTagger API Pods"]
-    API --> MMDB["GeoLite2 MMDB"]
-    API -->|"durable publish"| NATS["NATS JetStream"]
-    NATS --> WORKER["Audit worker"]
-    WORKER --> CH["ClickHouse"]
-```
+City, region and coordinate values are IP-geolocation estimates. They are not GPS readings and must not be presented as exact device location. Consumers should use the returned `accuracy_radius_km` and treat missing fields as unavailable rather than inferring values.
 
-The deployed cluster is a single K3s node inside a dedicated Proxmox VM. Kubernetes provides workload reconciliation, readiness-aware routing, API autoscaling, scheduled MMDB updates, internal service discovery, persistent volumes and network policy. It does not provide hardware high availability for the single VM/host.
+The richer response data is returned to the authenticated caller, while the existing durable audit record remains minimized: HMAC-derived IP representation, caller/request IDs, country-level result, outcome/status, lookup latency and database-version metadata.
 
 ## Compliance status
 
