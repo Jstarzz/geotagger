@@ -2,7 +2,7 @@
 
 ## Executive summary
 
-GeoTagger is a self-hosted, authenticated IP-to-country service for on-premises deployment. It resolves public IPv4 and IPv6 addresses against a local MaxMind GeoLite2 Country database and records a durable audit event for each request.
+GeoTagger is a self-hosted, authenticated IP intelligence service for on-premises deployment. It resolves public IPv4 and IPv6 addresses against local MaxMind GeoLite2 City and ASN databases, returns geographic/network metadata, and records a durable privacy-preserving audit event for each authenticated lookup.
 
 Public endpoint:
 
@@ -10,193 +10,129 @@ Public endpoint:
 https://geo.itsjosiahdavis.dev
 ```
 
-The business function is small:
+The core business function is now:
 
 ```text
-public IP address -> country
+public IP address
+-> geographic estimate
+-> network/ASN identity
+-> source/version metadata
+-> durable audit record
 ```
 
-The surrounding design addresses operational requirements that a bare lookup handler would not cover:
+The project is not intended to provide GPS-quality location. IP-derived city/region/coordinates are estimates and are returned with an accuracy radius where available.
 
-- machine-to-machine authentication;
-- request validation and private-address rejection;
-- local GeoIP resolution with no request-time third-party lookup;
-- request correlation IDs;
-- HMAC-based audit privacy;
-- durable fail-closed audit acceptance;
-- asynchronous ClickHouse persistence;
-- Kubernetes health/restart behavior;
-- API autoscaling;
-- persistent NATS and ClickHouse state;
-- internal network isolation;
-- secret injection;
-- scheduled MMDB refresh;
-- Cloudflare Tunnel ingress; and
-- measured end-to-end validation.
+## Why the service exists
 
-GeoTagger should therefore be treated as a small service with a production-oriented control plane, not as a single endpoint script.
+A hosted service such as IPinfo can answer a simple GeoIP question, but GeoTagger is built around a different set of operational requirements:
 
-## Problem statement
+- local lookup data rather than a third-party HTTP dependency per request;
+- machine-specific authentication;
+- privacy-preserving retained audit data;
+- durable request accounting;
+- request/audit correlation through server-generated IDs;
+- controlled retention and infrastructure ownership;
+- autoscaling and health-aware routing;
+- network isolation for stateful components;
+- scheduled local database refreshes; and
+- explicit source/build metadata and geolocation uncertainty.
 
-Applications may need country-level context from a public IP address for routing, analytics, operational logging, risk context or shared internal services.
+The architecture should therefore be evaluated as an internal infrastructure service, not merely as a replacement for a one-line `curl` command.
 
-Calling a third-party GeoIP API for every lookup adds:
-
-- request-time network dependency;
-- external data disclosure;
-- latency;
-- API quotas or recurring cost;
-- vendor availability dependency; and
-- less control over retention and audit policy.
-
-GeoTagger keeps the active database and request processing local.
-
-## Design goals
-
-### Local lookup
-
-Successful lookups must not depend on an outbound MaxMind/API call. The GeoLite2 Country MMDB is stored locally and memory-mapped by the Go API.
-
-### Small synchronous path
+## Public API surface
 
 ```text
-authenticate
--> validate JSON and IP
--> local MMDB lookup
--> durable audit publish
--> return JSON
+POST /v1/lookup       full City + ASN intelligence
+GET  /v1/lookup?ip=  full lookup using query parameter
+GET  /v1/me           full lookup for observed caller IP
+POST /v1/country      backward-compatible country-only response
 ```
 
-ClickHouse writes occur asynchronously after durable queue acceptance.
+All endpoints require the same application bearer credential.
 
-### Durable auditing
+## Full intelligence model
 
-A normal result is not returned if the required audit event cannot be accepted by JetStream.
-
-### Privacy by default
-
-`AUDIT_IP_MODE=hmac` is the default. The audit store receives an HMAC-SHA256 representation of the queried IP instead of the raw address.
-
-### Machine-oriented authentication
-
-Each integration receives a bearer credential in the form:
+A rich lookup can return:
 
 ```text
-key-id.secret
+normalized IP
+matched network/CIDR
+continent
+country
+region/subdivision
+city
+postal code
+estimated latitude/longitude
+accuracy radius
+timezone
+ASN
+ASN organization
+public/private/loopback/link-local classification
+IP version
+City MMDB build/version
+ASN MMDB build/version
+lookup latency
+request ID
 ```
 
-Only the SHA-256 digest of the secret is configured server-side.
+Fields unavailable in the current database snapshot are left empty/omitted rather than inferred.
 
-### Automatic workload recovery
+## Data sources
 
-K3s handles Deployment reconciliation, probes, Services, rolling updates and stateful volume attachment.
-
-### Measurable scaling
-
-The API HPA can scale from one to eight Pods with a 65% CPU target. This uses spare capacity inside the current VM; it does not add hardware.
-
-### Defined failure behavior
-
-| Condition | Expected behavior |
-|---|---|
-| MMDB missing | API does not become ready |
-| NATS unavailable | audited lookup path fails closed |
-| JetStream full | new required audit events are rejected |
-| worker unavailable | JetStream backlog grows |
-| ClickHouse unavailable | backlog remains durable until recovery |
-| cloudflared unavailable | public endpoint unavailable; internal cluster remains private |
-| VM/host unavailable | entire one-node cluster unavailable |
-
-## Non-goals
-
-GeoTagger does not currently provide:
-
-- precise GPS coordinates;
-- authoritative city/street geolocation;
-- identity verification;
-- VPN/proxy/fraud scoring;
-- ASN/ISP intelligence beyond the configured MMDB;
-- multi-region HA;
-- automatic node/hardware autoscaling;
-- a public unauthenticated lookup service; or
-- regulatory compliance by itself.
-
-## API contract
-
-```http
-POST /v1/country
-Authorization: Bearer <key-id.secret>
-Content-Type: application/json
-```
-
-```json
-{"ip":"8.8.8.8"}
-```
-
-Success:
-
-```json
-{"country":"United States"}
-```
-
-Every response includes `X-Request-ID`. See `API.md` for status/error semantics and integration guidance.
-
-## End-to-end architecture
-
-```mermaid
-flowchart TB
-    CLIENT["Authorized machine client"] -->|"HTTPS + bearer token"| CF["Cloudflare Edge"]
-    CF -->|"Cloudflare Tunnel"| TUNNEL["cloudflared Pod"]
-    TUNNEL --> SVC["Kubernetes Service: geotagger"]
-    SVC --> API["Go API Pods"]
-    HPA["HPA: 1 to 8 Pods"] --> API
-    API -->|"memory-mapped lookup"| MMDB["GeoLite2 Country MMDB"]
-    API -->|"durable publish and ACK"| NATS["NATS JetStream"]
-    NATS --> WORKER["Audit worker"]
-    WORKER -->|"batched insert"| CH["ClickHouse audit store"]
-```
-
-Synchronous path:
+GeoTagger uses:
 
 ```text
-client -> Cloudflare -> API -> local MMDB -> JetStream ACK -> client
+GeoLite2-City.mmdb
+GeoLite2-ASN.mmdb
 ```
 
-Asynchronous persistence path:
+Both are downloaded with the existing `MAXMIND_LICENSE_KEY`. No additional third-party lookup API key is required.
+
+The API uses the Go MaxMind DB reader and keeps long-lived memory-mapped readers open for both files.
+
+## Normal request flow
 
 ```text
-JetStream -> audit worker -> ClickHouse
+authenticate caller
+-> parse/normalize IP
+-> apply public-address policy
+-> City MMDB lookup
+-> ASN MMDB lookup
+-> construct response
+-> create privacy-preserving audit event
+-> durable JetStream publish + ACK
+-> return response
 ```
 
-## Component responsibilities
+ClickHouse insertion occurs asynchronously after the request returns.
 
-### Go API
+## Audit model
 
-- authenticate bearer credentials;
-- bound and parse requests;
-- validate the target IP;
-- reject non-permitted private/local targets;
-- resolve country from the local MMDB;
-- generate request IDs;
-- apply audit IP policy;
-- publish audit events durably to NATS;
-- return the HTTP result; and
-- expose internal health/readiness/metrics endpoints.
+GeoTagger deliberately does not retain the full rich response by default.
 
-### GeoLite2 Country MMDB
+The audit record contains:
 
-- provides local IP-to-country data;
-- avoids request-time third-party calls;
-- is refreshed on a schedule; and
-- is atomically replaced to avoid partial-file reads.
+```text
+timestamp
+request ID
+caller ID
+HMAC/raw/omitted IP according to policy
+country code/name
+outcome
+HTTP status
+lookup latency
+combined City/ASN database-version metadata
+```
 
-### NATS JetStream
+The default IP mode is HMAC-SHA256, so the raw target IP is not stored in the ClickHouse audit row.
 
-- provides the durable boundary between API response and audit persistence;
-- retains unacknowledged work during worker/ClickHouse outages; and
-- enforces a bounded queue size.
+This design allows repeated-address correlation while reducing retained identifier exposure.
 
-Production stream settings:
+## Durability contract
+
+Normal success depends on NATS JetStream accepting the audit event durably.
+
+Current stream safety settings:
 
 ```text
 Retention: WorkQueue
@@ -205,352 +141,227 @@ MaxBytes:  8 GiB
 Discard:   DiscardNew
 ```
 
-### Audit worker
+If the required durable publish cannot complete, GeoTagger fails closed instead of returning a normal successful lookup without its required audit event.
 
-- consumes JetStream messages;
-- batches events;
-- inserts into ClickHouse; and
-- ACKs NATS only after successful persistence.
+## Asynchronous persistence
 
-Delivery is at-least-once. Duplicate ClickHouse rows are possible if a worker crashes after insert and before ACK.
-
-### ClickHouse
-
-- stores audit events;
-- supports append-heavy analytical access; and
-- applies a 30-day TTL to the current audit table.
-
-Table:
+The worker consumes JetStream messages in batches and inserts them into ClickHouse.
 
 ```text
-geotagger.audit_events
+JetStream
+-> audit worker
+-> batched JSONEachRow insert
+-> ClickHouse
+-> ACK NATS only after successful persistence
 ```
 
-### cloudflared
+Delivery is at least once. A crash between ClickHouse insertion and the NATS ACK can create duplicate rows; `request_id` is available for deduplication/correlation.
 
-- creates outbound Cloudflare Tunnel connections; and
-- forwards public traffic to the internal API Service.
+## MMDB update lifecycle
 
-No inbound WAN port-forward is required.
-
-### MMDB updater
-
-- downloads GeoLite2 Country;
-- validates and fsyncs the replacement file; and
-- atomically renames it into the active path.
-
-The CronJob runs at 03:17 daily.
-
-## Trust boundaries
-
-```mermaid
-flowchart LR
-    CLIENT["Untrusted client"] --> EDGE["Cloudflare provider boundary"]
-    EDGE --> CFD["cloudflared"]
-    CFD --> API["GeoTagger API"]
-    API --> NATS["NATS"]
-    NATS --> WORKER["Audit worker"]
-    WORKER --> CH["ClickHouse"]
-    ADMIN["Kubernetes / Proxmox administrators"] --> API
-    ADMIN --> NATS
-    ADMIN --> CH
-```
-
-Assumptions:
-
-- client requests are untrusted until application authentication succeeds;
-- Cloudflare does not replace application authentication;
-- NATS and ClickHouse remain internal-only;
-- Kubernetes/Proxmox administrator access is highly privileged; and
-- production credential/recovery processes exist outside the application code.
-
-## Authentication flow
-
-Credential issuance:
-
-```mermaid
-sequenceDiagram
-    participant K as keygen
-    participant A as Administrator
-    participant C as Client
-    participant S as Server secret
-    K->>A: client token and digest entry
-    A->>C: transfer client token
-    A->>S: store key ID and digest only
-```
-
-Request verification:
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant A as GeoTagger API
-    participant S as API_KEYS config
-    C->>A: Authorization Bearer key-id.secret
-    A->>A: parse key ID and secret
-    A->>A: SHA-256 supplied secret
-    A->>S: load expected digest
-    A->>A: constant-time compare
-    A-->>C: accept or 401
-```
-
-Each integration should have its own key ID so one caller can be revoked without rotating unrelated callers.
-
-## Public-IP policy
-
-The default policy rejects private, loopback and link-local targets.
-
-Examples:
+The scheduled updater manages City and ASN together.
 
 ```text
-10.0.0.0/8
-172.16.0.0/12
-192.168.0.0/16
-127.0.0.0/8
-link-local IPv4/IPv6
+CronJob starts updater
+-> download both archives
+-> stage both MMDB files
+-> fsync staged files
+-> open/verify each database
+-> begin live replacement only after all verification succeeds
+-> atomic rename City
+-> atomic rename ASN
+-> fsync directory
+-> API notices changed files
+-> hot-reload changed readers
 ```
 
-A validated request for `10.0.0.1` returned HTTP 422:
+Each final file replacement is atomic. A host/process crash between the two final renames can temporarily leave City and ASN on different build timestamps; GeoTagger tolerates that state and exposes each source version separately.
 
-```json
-{"error":"IP address is not a permitted public address"}
-```
+The updater keeps legacy single-edition configuration support for custom deployments.
 
-## Privacy model
+## Caller self-lookup
 
-Default:
+`GET /v1/me` resolves the caller IP observed through the public ingress path.
+
+Preferred source:
 
 ```text
-AUDIT_IP_MODE=hmac
+CF-Connecting-IP
 ```
 
-The HMAC value remains sensitive because it is stable/correlatable under the same key. The HMAC key must be protected separately from the audit dataset.
+Fallbacks exist for trusted internal/direct testing.
 
-Supported modes:
+The origin must remain restricted to the Cloudflare Tunnel/internal trust boundary. Forwarded headers must not become an untrusted identity source if the origin is later exposed directly.
+
+## Public-address policy
+
+By default, requested targets must be valid public global-unicast addresses.
+
+Rejected by default:
 
 ```text
-hmac  default; stable keyed representation
-raw   stores raw queried address; requires explicit justification
-omit  stores no target representation
+RFC1918 private addresses
+loopback
+link-local
+malformed IPs
 ```
 
-See `DATA_CLASSIFICATION.md` before enabling raw retention.
+This prevents callers from treating internal/private addresses as meaningful Internet geolocation targets.
 
-## Request lifecycle
+## Geolocation accuracy boundary
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant CF as Cloudflare
-    participant T as cloudflared
-    participant S as K8s Service
-    participant A as API Pod
-    participant M as MMDB
-    participant N as NATS
-    participant W as Audit worker
-    participant H as ClickHouse
-    C->>CF: HTTPS POST /v1/country
-    CF->>T: tunnel request
-    T->>S: HTTP on port 8080
-    S->>A: route to ready API Pod
-    A->>A: authenticate and validate
-    A->>M: local country lookup
-    M-->>A: country result
-    A->>N: durable audit publish
-    N-->>A: publish ACK
-    A-->>C: response with X-Request-ID
-    N->>W: deliver audit message
-    W->>H: batched INSERT
-    H-->>W: success
-    W->>N: ACK consumed message
-```
+Country-level results are generally more robust than city-level results. City, region and coordinates may represent an ISP/network registration or approximate geolocation rather than the physical endpoint.
 
-## Delivery semantics
+Consumers must:
 
-Normal worker flow:
+- treat city/region as estimates;
+- display/use the returned accuracy radius where relevant;
+- avoid describing IP-derived coordinates as GPS/device location; and
+- tolerate missing or changing values after MMDB updates.
+
+## Kubernetes deployment
+
+The deployed service runs inside one K3s VM.
+
+Main resources:
 
 ```text
-receive NATS event
--> insert ClickHouse row
--> ACK NATS event
+Deployment/geotagger-api
+HorizontalPodAutoscaler/geotagger-api
+Deployment/geotagger-audit-worker
+StatefulSet/nats
+StatefulSet/clickhouse
+Deployment/cloudflared
+Job/geotagger-mmdb-bootstrap
+CronJob/geotagger-mmdb-update
+Service/geotagger
+Service/nats
+Service/clickhouse
+NetworkPolicy objects
+Kubernetes Secret/geotagger-secrets
 ```
 
-Crash window:
+See `KUBERNETES.md` for details.
+
+## API scaling
+
+Current API autoscaling:
 
 ```text
-insert succeeds
--> worker crashes before ACK
--> NATS redelivers
--> duplicate row may be inserted
+minimum replicas: 2
+maximum replicas: 8
+CPU request: 750m
+CPU target: 65%
 ```
 
-Use `request_id` when deduplication matters.
+Scaling is horizontal only within the one 9-vCPU VM. It can use spare cores but cannot create new hardware capacity.
 
-## Kubernetes model
+## State and storage
 
-```mermaid
-flowchart TB
-    NS["Namespace: geotagger"] --> API["Deployment: geotagger-api"]
-    NS --> WORKER["Deployment: audit worker"]
-    NS --> CFD["Deployment: cloudflared"]
-    NS --> NATS["StatefulSet: nats"]
-    NS --> CH["StatefulSet: clickhouse"]
-    NS --> CRON["CronJob: MMDB updater"]
-    HPA["HPA: 1 to 8"] --> API
-    SVC["Service: geotagger"] --> API
+Stateful data:
+
+```text
+NATS JetStream -> persistent volume
+ClickHouse     -> persistent volume
+City MMDB      -> node-local file
+ASN MMDB       -> node-local file
 ```
 
-See `KUBERNETES.md` for lifecycle, probes, PVCs, Services and operating commands.
+API Pods are otherwise replaceable/stateless.
 
-## Autoscaling
-
-```mermaid
-flowchart LR
-    ONE["1 API Pod"] -->|"CPU increases"| MORE["additional API Pods"]
-    MORE -->|"continued load"| MAX["up to 8 Pods"]
-    MAX -->|"load decreases after stabilization"| ONE
-```
-
-All replicas currently share one 9-vCPU VM. HPA improves use of spare node capacity; it is not hardware autoscaling.
-
-## Observed performance
-
-Initial public-path tests:
-
-| Target tier | Achieved throughput | p95 | p99 | HDD utilization |
-|---:|---:|---:|---:|---:|
-| 100 RPS | ~100 req/s | 190 ms | 203 ms | <1% |
-| 1,000 RPS | ~668 req/s | 2.08 s | 3.81 s | <1% |
-| 5,000 RPS | ~1,373 req/s | 14.3 s | 20.3 s | <3% |
-| 10,000 RPS | ~322-643 req/s | 6.2-8.2 s | much higher | <1% |
-
-The load generator ran on the same 9-vCPU VM as K3s, API replicas, NATS, ClickHouse, worker and cloudflared, while traffic traversed the public Cloudflare path. CPU contention appeared before disk saturation.
-
-A verified request recorded a 56-microsecond MMDB lookup. That figure describes the local lookup, not end-to-end request latency.
-
-For the tested topology, approximately 500-1,000 RPS is a reasonable operational range before tail latency becomes poor. A clean ceiling requires an external load generator. See `PERFORMANCE.md`.
-
-## Storage model
-
-```mermaid
-flowchart TB
-    PVE["Proxmox datastore"] --> VDISK["GeoTagger VM data disk"]
-    VDISK --> K3S["K3s local-path data"]
-    K3S --> NPV["NATS PVC: 10 GiB"]
-    K3S --> CPV["ClickHouse PVC: 50 GiB"]
-    VDISK --> MMDB["MMDB directory"]
-```
-
-The current VM/data disk is a single infrastructure failure domain. Backups must live independently of it. See `BACKUP_RECOVERY.md`.
-
-## Observability
-
-Monitor at least:
-
-**API:** RPS, status distribution, p50/p95/p99, authentication failures, readiness/liveness, replicas, CPU and RAM.
-
-**NATS:** stream bytes/messages, pending count, redeliveries, publish failures/timeouts and capacity utilization.
-
-**Worker:** events/s, batch size, ClickHouse failures and processing lag.
-
-**ClickHouse:** insert errors/throughput, disk growth, merge/TTL behavior and query health.
-
-**VM/node:** CPU saturation, RAM pressure, disk latency/utilization, filesystem usage and network RTT.
-
-## Security posture
+## Security boundary
 
 Implemented controls include:
 
-- Cloudflare Tunnel instead of direct inbound origin exposure;
-- per-caller bearer authentication;
-- secret digests instead of plaintext caller secrets server-side;
-- HMAC audit mode by default;
-- private/local address rejection;
-- bounded strict JSON parsing;
-- default-deny namespace ingress;
-- internal-only NATS/ClickHouse Services;
-- non-root numeric UIDs for API/worker/NATS;
-- dropped capabilities and read-only root filesystems for application containers; and
-- K3s Secrets encryption configuration.
-
-Open controls and compliance requirements are tracked in `SECURITY_AUDIT.md` and `HIPAA_READINESS.md`.
-
-## Data retention
-
-ClickHouse currently applies:
-
-```sql
-TTL timestamp + INTERVAL 30 DAY DELETE
+```text
+per-caller bearer credentials
+server-side SHA-256 secret digests
+constant-time verification
+HMAC IP audit mode
+strict/bounded request parsing
+Cloudflare Tunnel ingress
+Kubernetes NetworkPolicy
+internal-only NATS/ClickHouse Services
+non-root application containers
+read-only root filesystems where supported
+dropped capabilities
+internal admin listener
+K3s secret encryption recommendation
 ```
 
-This is an application default. It is not a universal HIPAA or legal retention requirement. Regulated deployments must approve retention based on the actual data classification and policy requirements.
+The richer response data does not change the basic authentication model.
 
-JetStream is a transport buffer for not-yet-persisted work, not a second 30-day archive.
+## MFA boundary
 
-## Software delivery
+Interactive MFA is for privileged humans, not automated API requests.
 
-Application images:
+Privileged human systems should use MFA where supported:
 
 ```text
-ghcr.io/jstarzz/geotagger-api
-ghcr.io/jstarzz/geotagger-worker
-ghcr.io/jstarzz/geotagger-updater
+Cloudflare
+GitHub
+Proxmox
+SSH/VPN/bastion
+Kubernetes administration
+backup/secret systems
+future human admin UI
 ```
 
-CI checks include Go tests/race detection, vetting, vulnerability scanning, Kustomize rendering, ClickHouse compatibility, image builds and NATS-to-ClickHouse integration.
+Machine authentication can later be strengthened with mTLS/workload identity if needed.
 
-Production deployments should use approved immutable image references rather than relying indefinitely on mutable `latest` tags.
+## HIPAA/compliance boundary
 
-## Scaling roadmap
+The repository does not declare the deployment HIPAA compliant.
 
-Current:
+Before ePHI use, complete the applicable:
 
 ```text
-1 physical host
--> 1 Proxmox VM
--> 1 K3s node
--> 1 to 8 API Pods
--> 1 NATS
--> 1 worker
--> 1 ClickHouse
+risk analysis
+risk-management plan
+vendor/BAA review
+access-control procedures
+backup/restore validation
+incident/breach procedures
+audit retention/review
+workforce/administrative controls
+periodic evaluation
 ```
 
-Before adding nodes:
+See `HIPAA_READINESS.md`.
 
-1. run load generation from a separate machine;
-2. measure internal Service path separately from public Cloudflare path;
-3. define latency/RPS SLOs;
-4. identify the true CPU ceiling; and
-5. determine whether more/newer CPU is sufficient.
+## Performance status
 
-Potential multi-node API layout:
+The first benchmark measured the earlier country-only implementation and found CPU contention before HDD saturation. A verified country MMDB lookup took 56 microseconds, and disk utilization stayed low during the test.
 
-```mermaid
-flowchart TB
-    SVC["GeoTagger Service"] --> N1["Node 1: API"]
-    SVC --> N2["Node 2: API and worker"]
-    SVC --> N3["Node 3: API"]
-```
+The new full lookup performs two MMDB decodes and returns substantially more JSON, so those old throughput numbers must not be presented as measured `/v1/lookup` capacity.
 
-Stateful HA would still require replicated NATS, ClickHouse/storage design and independent failure domains.
-
-## Operational acceptance
-
-A healthy deployment must pass more than `kubectl get pods`.
+Required follow-up benchmark:
 
 ```text
-[ ] public DNS resolves
-[ ] Cloudflare Tunnel connected
-[ ] valid caller authenticates
-[ ] public IP returns expected country
-[ ] X-Request-ID returned
-[ ] JetStream accepts audit event durably
-[ ] worker consumes event
-[ ] matching request ID appears in ClickHouse
-[ ] stored target representation matches configured privacy mode
-[ ] invalid token returns 401
-[ ] private target returns 422
-[ ] backup/recovery status is current
-[ ] security/compliance gate matches the environment's data classification
+external load generator
+country endpoint baseline
+rich POST lookup
+rich GET lookup
+self lookup
+origin-side latency metrics
+public Cloudflare latency
+CPU/HPA behavior
+JetStream ACK latency
 ```
+
+Redis is not currently justified because City and ASN are already local memory-mapped datasets. Add caching only if realistic traffic proves MMDB decode work is a meaningful bottleneck.
+
+## Operational success criteria
+
+A deployment is considered functionally validated when:
+
+1. City and ASN MMDB files are present and verified;
+2. API Pods are ready;
+3. NATS and ClickHouse are healthy;
+4. Cloudflare Tunnel is connected;
+5. an authenticated public rich lookup succeeds;
+6. the response includes `X-Request-ID` and source metadata;
+7. the exact request ID appears in ClickHouse; and
+8. the retained `ip_value` follows the configured privacy mode.
+
+Capacity/SLO validation is a separate benchmark exercise.
