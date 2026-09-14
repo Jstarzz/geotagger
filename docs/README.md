@@ -7,6 +7,7 @@ This directory is the technical and operational handoff for the deployed GeoTagg
 - [Client Quickstart](CLIENT_QUICKSTART.md) — Yaak and cURL setup, authentication header, test addresses and end-to-end audit verification.
 - [`openapi.yaml`](../openapi.yaml) — machine-readable OpenAPI 3.1 contract suitable for importing into Yaak, Postman and other API clients.
 - [City + ASN Upgrade Runbook](UPGRADE_CITY_ASN.md) — production migration, verification, rollback and post-upgrade benchmark procedure for an existing country-only deployment.
+- [Admin Control Plane](ADMIN_CONTROL_PLANE.md) — pre-implementation security/operational contract for Cloudflare Access, managed API-key lifecycle, one-time token handling and the dedicated admin hostname.
 - [Project Overview](PROJECT_OVERVIEW.md) — purpose, design goals, component responsibilities, trust boundaries, request lifecycle, scaling and operational acceptance.
 - [Production Architecture](ARCHITECTURE.md) — physical placement, Cloudflare ingress, Kubernetes topology, synchronous lookup, durable audit pipeline, storage, networking, scaling and failure recovery.
 - [Kubernetes / K3s Guide](KUBERNETES.md) — Pods versus containers, containerd, Deployments, StatefulSets, Services, HPA, PVCs, probes, CronJobs, NetworkPolicy, Secrets and operating commands.
