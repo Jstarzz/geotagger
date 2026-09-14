@@ -17,6 +17,8 @@ import (
 	"github.com/Jstarzz/geotagger/internal/geo"
 )
 
+const testLookupVersion = "city=GeoLite2-City@test;asn=GeoLite2-ASN@test"
+
 type fakeLookup struct{}
 
 func (fakeLookup) Lookup(ip netip.Addr) (geo.Result, bool, error) {
@@ -37,9 +39,11 @@ func (fakeLookup) Lookup(ip netip.Addr) (geo.Result, bool, error) {
 			ASN: asn, ASNOrganization: org, CityDatabaseVersion: "GeoLite2-City@test", ASNDatabaseVersion: "GeoLite2-ASN@test",
 		}, true, nil
 	}
-	return geo.Result{}, false, nil
+	// Real MaxMind lookups still know which database generation was queried even
+	// when neither database has usable intelligence for the address.
+	return geo.Result{CityDatabaseVersion: "GeoLite2-City@test", ASNDatabaseVersion: "GeoLite2-ASN@test"}, false, nil
 }
-func (fakeLookup) Version() string { return "city=test;asn=test" }
+func (fakeLookup) Version() string { return "city=current-after-reload;asn=current-after-reload" }
 func (fakeLookup) Close() error    { return nil }
 
 type fakeAudit struct{ events []audit.Event }
@@ -88,6 +92,9 @@ func TestCountry(t *testing.T) {
 	if a.events[0].RequestID != requestID {
 		t.Fatalf("audit request_id=%q response request_id=%q", a.events[0].RequestID, requestID)
 	}
+	if a.events[0].MMDBVersion != testLookupVersion {
+		t.Fatalf("audit MMDB version=%q want=%q", a.events[0].MMDBVersion, testLookupVersion)
+	}
 }
 
 func TestFullLookupPOST(t *testing.T) {
@@ -114,6 +121,29 @@ func TestFullLookupPOST(t *testing.T) {
 	}
 	if len(a.events) != 1 {
 		t.Fatalf("events=%d", len(a.events))
+	}
+	if a.events[0].MMDBVersion != testLookupVersion {
+		t.Fatalf("audit MMDB version=%q want=%q", a.events[0].MMDBVersion, testLookupVersion)
+	}
+}
+
+func TestNotFoundAuditKeepsLookupGeneration(t *testing.T) {
+	s, a := testServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/lookup", strings.NewReader(`{"ip":"1.1.1.1"}`))
+	req.Header.Set("Authorization", "Bearer svc.secret")
+	rr := httptest.NewRecorder()
+	s.APIHandler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if len(a.events) != 1 {
+		t.Fatalf("events=%d", len(a.events))
+	}
+	if a.events[0].Outcome != "not_found" {
+		t.Fatalf("outcome=%q", a.events[0].Outcome)
+	}
+	if a.events[0].MMDBVersion != testLookupVersion {
+		t.Fatalf("audit MMDB version=%q want=%q", a.events[0].MMDBVersion, testLookupVersion)
 	}
 }
 
