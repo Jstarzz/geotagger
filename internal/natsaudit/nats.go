@@ -48,12 +48,17 @@ func ensureAuditStream(js nats.JetStreamContext, stream, subject string) error {
 			return fmt.Errorf("stream info: %w", err)
 		}
 		_, err = js.AddStream(&nats.StreamConfig{
-			Name:      stream,
-			Subjects:  []string{subject},
-			Storage:   nats.FileStorage,
-			Retention: nats.WorkQueuePolicy,
-			MaxBytes:  auditStreamMaxBytes,
-			Discard:   nats.DiscardNew,
+			Name:              stream,
+			Subjects:          []string{subject},
+			Storage:           nats.FileStorage,
+			Retention:         nats.WorkQueuePolicy,
+			MaxConsumers:      -1,
+			MaxMsgs:           -1,
+			MaxMsgsPerSubject: -1,
+			MaxBytes:          auditStreamMaxBytes,
+			MaxAge:            0,
+			Discard:           nats.DiscardNew,
+			NoAck:             false,
 		})
 		if err == nil {
 			return nil
@@ -65,11 +70,40 @@ func ensureAuditStream(js nats.JetStreamContext, stream, subject string) error {
 		}
 	}
 
-	// Reconcile the mutable safety settings on startup. Unacknowledged audit
-	// events must never disappear solely because they are old: capacity pressure
-	// is handled fail-closed with MaxBytes + DiscardNew instead.
+	// Memory-backed JetStream does not satisfy the durable-audit contract. Do
+	// not silently continue or attempt an in-place storage migration: fail the
+	// API startup/readiness path and require an explicit operator migration.
+	if info.Config.Storage != nats.FileStorage {
+		return fmt.Errorf("audit stream %q storage=%v; file storage is required", stream, info.Config.Storage)
+	}
+
+	// Reconcile the mutable safety contract on every API startup. A stale stream
+	// from an older deployment must not silently weaken durability or retain ACKed
+	// work forever. WorkQueue removes successfully ACKed messages; the only
+	// configured capacity bound is MaxBytes, and DiscardNew makes that bound fail
+	// closed instead of evicting older unpersisted audit events.
 	cfg := info.Config
 	changed := false
+	if len(cfg.Subjects) != 1 || cfg.Subjects[0] != subject {
+		cfg.Subjects = []string{subject}
+		changed = true
+	}
+	if cfg.Retention != nats.WorkQueuePolicy {
+		cfg.Retention = nats.WorkQueuePolicy
+		changed = true
+	}
+	if cfg.MaxConsumers != -1 {
+		cfg.MaxConsumers = -1
+		changed = true
+	}
+	if cfg.MaxMsgs != -1 {
+		cfg.MaxMsgs = -1
+		changed = true
+	}
+	if cfg.MaxMsgsPerSubject != -1 {
+		cfg.MaxMsgsPerSubject = -1
+		changed = true
+	}
 	if cfg.MaxAge != 0 {
 		cfg.MaxAge = 0
 		changed = true
@@ -82,9 +116,13 @@ func ensureAuditStream(js nats.JetStreamContext, stream, subject string) error {
 		cfg.Discard = nats.DiscardNew
 		changed = true
 	}
+	if cfg.NoAck {
+		cfg.NoAck = false
+		changed = true
+	}
 	if changed {
 		if _, err := js.UpdateStream(&cfg); err != nil {
-			return fmt.Errorf("update audit stream safety limits: %w", err)
+			return fmt.Errorf("reconcile audit stream durability contract: %w", err)
 		}
 	}
 	return nil
