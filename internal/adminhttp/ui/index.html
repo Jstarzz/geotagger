@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GeoTagger Admin</title>
+  <link rel="stylesheet" href="/admin/assets/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">GeoTagger</p>
+      <h1>Admin control plane</h1>
+    </div>
+    <div class="identity">
+      <span id="session-email">Loading identity…</span>
+      <span class="access-badge">Cloudflare Access</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="status-grid" aria-label="Service status">
+      <article class="status-cell">
+        <span class="label">Service</span>
+        <strong id="service-ready">—</strong>
+      </article>
+      <article class="status-cell">
+        <span class="label">NATS / key store</span>
+        <strong id="key-store-status">—</strong>
+      </article>
+      <article class="status-cell">
+        <span class="label">Managed keys</span>
+        <strong id="key-count">—</strong>
+      </article>
+      <article class="status-cell wide">
+        <span class="label">MMDB generation</span>
+        <strong id="mmdb-version">—</strong>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <p class="eyebrow">Machine credentials</p>
+          <h2>Managed API keys</h2>
+          <p class="muted">Secrets are generated server-side and shown once. Static break-glass keys are intentionally not listed here.</p>
+        </div>
+        <button id="show-create" class="primary" type="button">Create key</button>
+      </div>
+
+      <div id="notice" class="notice hidden" role="status"></div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Key ID</th>
+              <th>Owner</th>
+              <th>Environment</th>
+              <th>Status</th>
+              <th>Created</th>
+              <th>Expires</th>
+              <th class="actions-col">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="key-rows">
+            <tr><td colspan="7" class="empty">Loading managed credentials…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="create-panel" class="panel hidden" aria-labelledby="create-title">
+      <div class="panel-heading compact">
+        <div>
+          <p class="eyebrow">New machine identity</p>
+          <h2 id="create-title">Create API key</h2>
+        </div>
+        <button id="cancel-create" class="secondary" type="button">Cancel</button>
+      </div>
+      <form id="create-form" autocomplete="off">
+        <div class="form-grid">
+          <label>Key ID
+            <input name="id" required maxlength="64" pattern="[A-Za-z0-9_-]+" placeholder="ndhis-prod">
+          </label>
+          <label>Display name
+            <input name="display_name" maxlength="128" placeholder="NDHIS production">
+          </label>
+          <label>Owner / service
+            <input name="owner" maxlength="128" placeholder="NDHIS">
+          </label>
+          <label>Environment
+            <input name="environment" maxlength="64" placeholder="production">
+          </label>
+          <label>Expires at <span class="muted">optional</span>
+            <input name="expires_at" type="datetime-local">
+          </label>
+        </div>
+        <div class="form-actions">
+          <button class="primary" type="submit">Generate key</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="token-panel" class="panel token-panel hidden" aria-live="polite">
+      <div class="panel-heading compact">
+        <div>
+          <p class="eyebrow">One-time secret</p>
+          <h2>Copy this token now</h2>
+          <p class="muted">GeoTagger does not retain the plaintext token. Reloading or dismissing this panel removes it from the page.</p>
+        </div>
+        <button id="dismiss-token" class="secondary" type="button">Dismiss</button>
+      </div>
+      <div class="token-row">
+        <code id="one-time-token"></code>
+        <button id="copy-token" class="primary" type="button">Copy</button>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>Privileged surface · no third-party scripts · responses are no-store</span>
+    <span id="server-time"></span>
+  </footer>
+
+  <script src="/admin/assets/app.js" defer></script>
+</body>
+</html>
