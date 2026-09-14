@@ -11,7 +11,8 @@ import (
 type API struct {
 	HTTPAddr        string
 	AdminAddr       string
-	MMDBPath        string
+	CityMMDBPath    string
+	ASNMMDBPath     string
 	MMDBReload      time.Duration
 	APIKeys         string
 	NATSURL         string
@@ -42,7 +43,8 @@ func LoadAPI() (API, error) {
 	c := API{
 		HTTPAddr:        getenv("HTTP_ADDR", ":8080"),
 		AdminAddr:       getenv("ADMIN_ADDR", ":9090"),
-		MMDBPath:        getenv("MMDB_PATH", "/data/GeoLite2-Country.mmdb"),
+		CityMMDBPath:    getenv("CITY_MMDB_PATH", "/data/GeoLite2-City.mmdb"),
+		ASNMMDBPath:     getenv("ASN_MMDB_PATH", "/data/GeoLite2-ASN.mmdb"),
 		APIKeys:         os.Getenv("API_KEYS"),
 		NATSURL:         getenv("NATS_URL", "nats://nats:4222"),
 		AuditStream:     getenv("AUDIT_STREAM", "GEOTAGGER_AUDIT"),
@@ -71,6 +73,9 @@ func LoadAPI() (API, error) {
 
 	if c.APIKeys == "" {
 		return API{}, errors.New("API_KEYS is required")
+	}
+	if c.CityMMDBPath == "" || c.ASNMMDBPath == "" {
+		return API{}, errors.New("CITY_MMDB_PATH and ASN_MMDB_PATH must be non-empty")
 	}
 	if c.AuditIPMode != "hmac" && c.AuditIPMode != "raw" && c.AuditIPMode != "omit" {
 		return API{}, fmt.Errorf("AUDIT_IP_MODE must be hmac, raw, or omit")
