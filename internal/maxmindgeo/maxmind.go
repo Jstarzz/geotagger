@@ -3,6 +3,7 @@ package maxmindgeo
 import (
 	"fmt"
 	"net/netip"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -10,6 +11,16 @@ import (
 
 	"github.com/oschwald/maxminddb-golang/v2"
 )
+
+type fileStamp struct {
+	resolvedPath string
+	modTime      time.Time
+	size         int64
+}
+
+func (s fileStamp) changed(previous fileStamp) bool {
+	return s.size > 0 && (s.resolvedPath != previous.resolvedPath || s.size != previous.size || !s.modTime.Equal(previous.modTime))
+}
 
 type MaxMind struct {
 	mu sync.RWMutex
@@ -20,8 +31,8 @@ type MaxMind struct {
 	asnReader   *maxminddb.Reader
 	cityVersion string
 	asnVersion  string
-	cityModTime time.Time
-	asnModTime  time.Time
+	cityStamp   fileStamp
+	asnStamp    fileStamp
 }
 
 type cityRecord struct {
@@ -66,7 +77,11 @@ type asnRecord struct {
 
 func OpenMaxMind(cityPath, asnPath string) (*MaxMind, error) {
 	m := &MaxMind{cityPath: cityPath, asnPath: asnPath}
-	if err := m.reload(true, true); err != nil {
+	cityStamp, asnStamp, err := m.snapshot()
+	if err != nil {
+		return nil, err
+	}
+	if err := m.reload(true, true, cityStamp, asnStamp); err != nil {
 		return nil, err
 	}
 	return m, nil
@@ -77,7 +92,7 @@ func (m *MaxMind) Lookup(ip netip.Addr) (geo.Result, bool, error) {
 	defer m.mu.RUnlock()
 
 	result := geo.Result{
-		IP:                 ip.String(),
+		IP:                  ip.String(),
 		CityDatabaseVersion: m.cityVersion,
 		ASNDatabaseVersion:  m.asnVersion,
 	}
@@ -175,42 +190,78 @@ func (m *MaxMind) Watch(interval time.Duration, stop <-chan struct{}, onError fu
 }
 
 func (m *MaxMind) ReloadIfChanged() (bool, error) {
-	cityInfo, err := statFile(m.cityPath)
-	if err != nil {
-		return false, err
-	}
-	asnInfo, err := statFile(m.asnPath)
+	cityStamp, asnStamp, err := m.snapshot()
 	if err != nil {
 		return false, err
 	}
 
 	m.mu.RLock()
-	cityChanged := cityInfo.Size() > 0 && cityInfo.ModTime().After(m.cityModTime)
-	asnChanged := asnInfo.Size() > 0 && asnInfo.ModTime().After(m.asnModTime)
+	cityChanged := cityStamp.changed(m.cityStamp)
+	asnChanged := asnStamp.changed(m.asnStamp)
 	m.mu.RUnlock()
 	if !cityChanged && !asnChanged {
 		return false, nil
 	}
-	if err := m.reload(cityChanged, asnChanged); err != nil {
+	if err := m.reload(cityChanged, asnChanged, cityStamp, asnStamp); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (m *MaxMind) reload(cityChanged, asnChanged bool) error {
+// snapshot resolves the configured paths before inspecting them. Production
+// paths both pass through the atomic /data/current symlink; requiring the two
+// resolved files to share the same directory prevents a reload from combining
+// City from one bundle generation with ASN from another if the symlink flips
+// between filesystem operations.
+func (m *MaxMind) snapshot() (fileStamp, fileStamp, error) {
+	sameLogicalDir := filepath.Clean(filepath.Dir(m.cityPath)) == filepath.Clean(filepath.Dir(m.asnPath))
+	for attempt := 0; attempt < 4; attempt++ {
+		cityStamp, err := stampFile(m.cityPath)
+		if err != nil {
+			return fileStamp{}, fileStamp{}, fmt.Errorf("stat city mmdb: %w", err)
+		}
+		asnStamp, err := stampFile(m.asnPath)
+		if err != nil {
+			return fileStamp{}, fileStamp{}, fmt.Errorf("stat ASN mmdb: %w", err)
+		}
+		if !sameLogicalDir || filepath.Dir(cityStamp.resolvedPath) == filepath.Dir(asnStamp.resolvedPath) {
+			return cityStamp, asnStamp, nil
+		}
+		// The bundle pointer likely changed between the two resolutions. Retry and
+		// obtain a coherent pair instead of exposing a mixed generation.
+		time.Sleep(time.Millisecond)
+	}
+	return fileStamp{}, fileStamp{}, fmt.Errorf("could not obtain a coherent City/ASN MMDB generation")
+}
+
+func stampFile(path string) (fileStamp, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return fileStamp{}, err
+	}
+	info, err := statFile(resolved)
+	if err != nil {
+		return fileStamp{}, err
+	}
+	if info.Size() <= 0 {
+		return fileStamp{}, fmt.Errorf("MMDB file is empty: %s", resolved)
+	}
+	return fileStamp{resolvedPath: resolved, modTime: info.ModTime(), size: info.Size()}, nil
+}
+
+func (m *MaxMind) reload(cityChanged, asnChanged bool, cityStamp, asnStamp fileStamp) error {
 	var newCity, newASN *maxminddb.Reader
 	var cityVersion, asnVersion string
-	var cityModTime, asnModTime time.Time
 	var err error
 
 	if cityChanged {
-		newCity, cityVersion, cityModTime, err = openVerified(m.cityPath)
+		newCity, cityVersion, err = openVerified(cityStamp.resolvedPath)
 		if err != nil {
 			return fmt.Errorf("open city mmdb: %w", err)
 		}
 	}
 	if asnChanged {
-		newASN, asnVersion, asnModTime, err = openVerified(m.asnPath)
+		newASN, asnVersion, err = openVerified(asnStamp.resolvedPath)
 		if err != nil {
 			if newCity != nil {
 				_ = newCity.Close()
@@ -225,12 +276,12 @@ func (m *MaxMind) reload(cityChanged, asnChanged bool) error {
 	if cityChanged {
 		m.cityReader = newCity
 		m.cityVersion = cityVersion
-		m.cityModTime = cityModTime
+		m.cityStamp = cityStamp
 	}
 	if asnChanged {
 		m.asnReader = newASN
 		m.asnVersion = asnVersion
-		m.asnModTime = asnModTime
+		m.asnStamp = asnStamp
 	}
 	m.mu.Unlock()
 
@@ -243,19 +294,15 @@ func (m *MaxMind) reload(cityChanged, asnChanged bool) error {
 	return nil
 }
 
-func openVerified(path string) (*maxminddb.Reader, string, time.Time, error) {
-	info, err := statFile(path)
-	if err != nil {
-		return nil, "", time.Time{}, err
-	}
+func openVerified(path string) (*maxminddb.Reader, string, error) {
 	reader, err := maxminddb.Open(path)
 	if err != nil {
-		return nil, "", time.Time{}, err
+		return nil, "", err
 	}
 	if err := reader.Verify(); err != nil {
 		_ = reader.Close()
-		return nil, "", time.Time{}, fmt.Errorf("verify mmdb: %w", err)
+		return nil, "", fmt.Errorf("verify mmdb: %w", err)
 	}
 	version := fmt.Sprintf("%s@%s", reader.Metadata.DatabaseType, reader.Metadata.BuildTime().UTC().Format(time.RFC3339))
-	return reader, version, info.ModTime(), nil
+	return reader, version, nil
 }
