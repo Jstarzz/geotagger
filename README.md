@@ -1,6 +1,6 @@
 # GeoTagger
 
-GeoTagger is a self-hosted, authenticated IP-to-country API for an on-premises K3s deployment. It uses a local MaxMind GeoLite2 Country database, requires durable audit acceptance through NATS JetStream before normal success, and persists audit events asynchronously to ClickHouse.
+GeoTagger is a self-hosted, authenticated IP intelligence API for an on-premises K3s deployment. It resolves public IP addresses from local MaxMind GeoLite2 City and ASN databases, requires durable audit acceptance through NATS JetStream before normal success, and persists audit events asynchronously to ClickHouse.
 
 Production endpoint:
 
@@ -8,16 +8,18 @@ Production endpoint:
 https://geo.itsjosiahdavis.dev
 ```
 
+Normal lookups do not call MaxMind, IPinfo, or another third-party geolocation API. City and ASN databases are downloaded on a schedule, verified, stored locally and memory-mapped by the API Pods.
+
 ## Documentation
 
-Start with the documentation index:
+Start with:
 
-- [`docs/README.md`](docs/README.md) — complete technical/operational handoff
-- [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md) — service purpose, components and request lifecycle
+- [`docs/README.md`](docs/README.md) — technical/operational handoff
+- [`docs/API.md`](docs/API.md) — full lookup API, `/v1/me`, country compatibility endpoint and response schema
+- [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md) — service purpose and components
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — production architecture and diagrams
 - [`docs/KUBERNETES.md`](docs/KUBERNETES.md) — K3s/Kubernetes resource model and operations
-- [`docs/API.md`](docs/API.md) — API integration contract
-- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — measured load-test results
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) — measured baseline load-test results
 - [`docs/PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md) — applied tuning, Redis/cache decision and scaling roadmap
 - [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md) — security review and remediation priorities
 - [`docs/HIPAA_READINESS.md`](docs/HIPAA_READINESS.md) — pre-ePHI control matrix and compliance gate
@@ -42,21 +44,104 @@ Kubernetes Service
     |
     v
 GeoTagger API Pods
-    |                \
-    |                 \ durable publish + ACK
-    v                  v
-GeoLite2 MMDB      NATS JetStream
-                       |
-                       v
-                  audit worker
-                       |
-                       v
-                   ClickHouse
+    |          |                 \
+    |          |                  \ durable publish + ACK
+    v          v                   v
+City MMDB   ASN MMDB          NATS JetStream
+                                   |
+                                   v
+                              audit worker
+                                   |
+                                   v
+                               ClickHouse
 ```
 
-The lookup itself is local; normal requests do not call MaxMind or another GeoIP provider over the network.
-
 ## API
+
+### Full intelligence lookup
+
+```http
+POST /v1/lookup
+Authorization: Bearer <key-id.secret>
+Content-Type: application/json
+```
+
+```json
+{"ip":"8.8.8.8"}
+```
+
+The response can include:
+
+```text
+matched network/CIDR
+continent
+country
+region/subdivision
+city
+postal code
+estimated latitude/longitude
+accuracy radius
+timezone
+ASN
+ASN organization
+IP classification
+City/ASN database build metadata
+lookup latency
+request ID
+```
+
+Example shape:
+
+```json
+{
+  "ip": "8.8.8.8",
+  "network": "8.8.8.0/24",
+  "country": {"code":"US","name":"United States"},
+  "city": "Mountain View",
+  "location": {
+    "latitude": 37.386,
+    "longitude": -122.0838,
+    "accuracy_radius_km": 20,
+    "timezone": "America/Los_Angeles"
+  },
+  "asn": {"number":15169,"organization":"Google LLC"},
+  "classification": {
+    "public": true,
+    "private": false,
+    "loopback": false,
+    "link_local": false,
+    "ip_version": "IPv4"
+  },
+  "source": {
+    "city_database": "GeoLite2-City@...",
+    "asn_database": "GeoLite2-ASN@..."
+  },
+  "lookup_latency_us": 90,
+  "request_id": "..."
+}
+```
+
+The values above are illustrative. IP geolocation is approximate; clients must not present city/coordinate output as GPS-precise location. Use `accuracy_radius_km` to communicate uncertainty.
+
+### Shell-style lookup
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer $API_TOKEN" \
+  'https://geo.itsjosiahdavis.dev/v1/lookup?ip=8.8.8.8'
+```
+
+### Look up the caller
+
+```bash
+curl -sS \
+  -H "Authorization: Bearer $API_TOKEN" \
+  https://geo.itsjosiahdavis.dev/v1/me
+```
+
+`/v1/me` uses the caller IP observed through the intended Cloudflare Tunnel path and returns the same rich response.
+
+### Backward-compatible country endpoint
 
 ```http
 POST /v1/country
@@ -68,13 +153,11 @@ Content-Type: application/json
 {"ip":"8.8.8.8"}
 ```
 
-Successful lookup:
-
 ```json
 {"country":"United States"}
 ```
 
-Every response includes `X-Request-ID`. The request ID is also stored in the audit event so a response can be correlated with its persisted audit record.
+Every response includes `X-Request-ID`. Rich lookup responses also include the same ID in JSON.
 
 Generate a caller credential with:
 
@@ -85,6 +168,19 @@ go run ./cmd/keygen azure-prod
 The client receives the generated token. The server stores only the corresponding SHA-256 digest entry.
 
 Private, loopback and link-local target addresses are rejected by default.
+
+## Data sources
+
+Production uses two local MaxMind databases:
+
+```text
+GeoLite2-City.mmdb
+GeoLite2-ASN.mmdb
+```
+
+The same existing `MAXMIND_LICENSE_KEY` is used to download both. No second MaxMind/API key is required.
+
+The updater downloads and verifies all configured editions before replacing live files. Each final database replacement is an atomic rename. The API watches both files and safely reopens a changed reader without restarting the Pod.
 
 ## Security model
 
@@ -102,6 +198,10 @@ Current technical controls include:
 - separate internal admin listener for health/readiness/metrics; and
 - durable JetStream acceptance before normal lookup success.
 
+The richer City/ASN response is not copied wholesale into ClickHouse. The audit record remains intentionally minimized to caller/request IDs, HMAC-derived IP value, country-level result, outcome/status, lookup latency and database-version metadata.
+
+`/v1/me` relies on Cloudflare forwarding metadata in the intended Tunnel origin path. Do not expose the API origin directly to untrusted clients and then trust arbitrary forwarding headers.
+
 GeoTagger is a machine API, so interactive MFA is not performed on each API request. Privileged human access to Cloudflare, GitHub, Proxmox, Kubernetes administration, backup/secret systems and any future human admin UI should use MFA. See [`docs/MFA_AND_IDENTITY.md`](docs/MFA_AND_IDENTITY.md).
 
 The repository does not claim that the deployment is HIPAA compliant. Before ePHI use, complete the risk analysis, vendor/BAA review, backup/recovery, identity/access, incident-response, audit-retention and other controls in [`docs/HIPAA_READINESS.md`](docs/HIPAA_READINESS.md).
@@ -118,8 +218,6 @@ CPU limit per API Pod: 2
 HPA CPU target: 65% of request
 scale-down stabilization: 5 minutes
 ```
-
-The CPU request was raised from `250m` because HPA utilization is calculated against the request. At `250m`, a 65% target represented only `162.5m` per Pod and caused overly aggressive scale-out on the 9-vCPU single-node deployment.
 
 Autoscaling changes Pod count; it does not add hardware. All API Pods currently share the same VM CPU budget.
 
@@ -148,7 +246,7 @@ That TTL is an application default, not a universal HIPAA/legal retention requir
 
 ## Performance status
 
-First public-path load test on the 9-vCPU VM:
+The first public-path load test was performed on the earlier country-only lookup path on the same 9-vCPU VM that ran k6 and the full K3s stack:
 
 | Target | Achieved | p95 | p99 | HDD utilization |
 |---:|---:|---:|---:|---:|
@@ -157,13 +255,13 @@ First public-path load test on the 9-vCPU VM:
 | 5,000 RPS | ~1,373 req/s | 14.3 s | 20.3 s | <3% |
 | 10,000 RPS | ~322-643 req/s | 6.2-8.2 s | much higher | <1% |
 
-The benchmark ran k6 on the same VM as the application and routed traffic through the public Cloudflare path. CPU contention appeared before disk saturation. A verified MMDB lookup took 56 microseconds.
+CPU contention appeared before disk saturation. A verified single-MMDB country lookup took 56 microseconds.
 
-For the tested topology, roughly 500-1,000 RPS is the current practical operating range before tail latency degrades sharply. That is not a clean server-side ceiling; the next benchmark should use an external generator.
+The new rich endpoint performs City + ASN decoding and emits a larger JSON response, so the old benchmark is a baseline, **not a measured capacity claim for `/v1/lookup`**. Re-run the external-generator benchmark after deploying this feature.
 
-Redis is not used or recommended for the current lookup path. The local memory-mapped MMDB lookup is already faster and simpler than an additional network cache. See [`docs/PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md).
+Redis is still not recommended by default. Both datasets are local memory-mapped MMDBs; adding Redis would create another network hop and stateful dependency before evidence shows MMDB decode cost is a material bottleneck. See [`docs/PERFORMANCE_TUNING.md`](docs/PERFORMANCE_TUNING.md).
 
-The API now exports separate origin-side histograms for:
+The API exports separate origin-side histograms for:
 
 ```text
 geotagger_lookup_latency_microseconds
@@ -173,7 +271,12 @@ geotagger_request_latency_microseconds
 
 ## MMDB updates
 
-The updater downloads GeoLite2 Country, validates the replacement, fsyncs it and atomically renames it into the active path.
+The updater defaults to:
+
+```text
+MAXMIND_EDITIONS=GeoLite2-City,GeoLite2-ASN
+MMDB_DIR=/data
+```
 
 Cron schedule:
 
@@ -181,13 +284,15 @@ Cron schedule:
 17 3 * * *
 ```
 
-`concurrencyPolicy: Forbid` prevents overlapping update Jobs. API Pods periodically reopen a changed database safely.
+`concurrencyPolicy: Forbid` prevents overlapping update Jobs. Both databases are downloaded and verified before live replacement begins; each final rename is atomic. The API periodically checks both files and hot-reloads changed readers.
 
 Required runtime secret:
 
 ```text
 MAXMIND_LICENSE_KEY
 ```
+
+Legacy/custom single-database updater mode remains available through `MAXMIND_EDITION` and `MMDB_PATH`.
 
 ## Configuration
 
@@ -197,7 +302,8 @@ API variables:
 |---|---:|---|
 | `HTTP_ADDR` | `:8080` | API listener |
 | `ADMIN_ADDR` | `:9090` | internal probes/metrics |
-| `MMDB_PATH` | `/data/GeoLite2-Country.mmdb` | MMDB path |
+| `CITY_MMDB_PATH` | `/data/GeoLite2-City.mmdb` | City database path |
+| `ASN_MMDB_PATH` | `/data/GeoLite2-ASN.mmdb` | ASN database path |
 | `MMDB_RELOAD_INTERVAL` | `5m` | update detection interval |
 | `API_KEYS` | required | `id:sha256hex` entries |
 | `NATS_URL` | `nats://nats:4222` | audit transport |
@@ -216,7 +322,7 @@ For a fresh K3s node:
 2. Verify Metrics Server works.
 3. Apply the `geotagger` namespace and a local, uncommitted production Secret.
 4. Configure the Cloudflare Tunnel public hostname to the internal Service.
-5. Deploy the K3s manifests.
+5. Deploy. The bootstrap Job downloads both City and ASN MMDBs before the API rollout.
 
 ```bash
 kubectl apply -f deploy/k3s/namespace.yaml
@@ -230,44 +336,24 @@ Verify:
 kubectl -n geotagger get pods,hpa,networkpolicy
 kubectl -n geotagger top pods
 kubectl -n geotagger get pvc
+ls -lh /var/lib/geotagger/mmdb/GeoLite2-{City,ASN}.mmdb
 ```
 
-Internal API port-forward:
-
-```bash
-kubectl -n geotagger port-forward svc/geotagger 18080:8080
-```
-
-Internal admin port-forward:
-
-```bash
-kubectl -n geotagger port-forward deployment/geotagger-api 19090:9090
-curl -fsS http://127.0.0.1:19090/readyz
-```
-
-End-to-end lookup:
+End-to-end rich lookup:
 
 ```bash
 curl -i \
   -H "Authorization: Bearer $API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"ip":"8.8.8.8"}' \
-  https://geo.itsjosiahdavis.dev/v1/country
+  https://geo.itsjosiahdavis.dev/v1/lookup
 ```
 
 A deployment is not considered validated until the returned `X-Request-ID` is also found in ClickHouse.
 
 ## Load testing
 
-Run k6 from a machine other than the GeoTagger VM for capacity measurements.
-
-```bash
-RPS=100 DURATION=60s BASE_URL=https://geo.itsjosiahdavis.dev API_TOKEN="$API_TOKEN" k6 run test/load/k6.js
-RPS=500 DURATION=60s BASE_URL=https://geo.itsjosiahdavis.dev API_TOKEN="$API_TOKEN" k6 run test/load/k6.js
-RPS=1000 DURATION=60s BASE_URL=https://geo.itsjosiahdavis.dev API_TOKEN="$API_TOKEN" k6 run test/load/k6.js
-```
-
-The load script treats both HTTP 200 and the legitimate `404 country not found` application result as expected responses for valid public fixture IPs. Unexpected 4xx/5xx responses still fail the test.
+Run k6 from a machine other than the GeoTagger VM for capacity measurements. The current k6 scenario exercises the compatibility country endpoint; add a dedicated rich-response scenario before publishing capacity figures for `/v1/lookup`.
 
 ## CI/CD
 
