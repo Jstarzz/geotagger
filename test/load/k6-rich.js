@@ -16,6 +16,11 @@ const publicIPs = [
   '2a10:50c0::ad1:ff',
 ];
 
+// A valid public IP may have no usable City/ASN record in a particular
+// GeoLite2 snapshot. Keep that application-level 404 out of k6's transport
+// failure metric while still rejecting every other unexpected status below.
+http.setResponseCallback(http.expectedStatuses(200, 404));
+
 export const options = {
   scenarios: {
     lookup: {
@@ -42,9 +47,8 @@ export default function () {
     },
   });
 
-  const expectedApplicationStatus = res.status === 200 || res.status === 404;
   check(res, {
-    'expected application status': () => expectedApplicationStatus,
+    'expected application status': (r) => r.status === 200 || r.status === 404,
     'request id returned': (r) => Boolean(r.headers['X-Request-Id']),
     'rich response has source metadata when found': (r) => {
       if (r.status !== 200) return true;
@@ -56,8 +60,4 @@ export default function () {
       }
     },
   });
-
-  if (expectedApplicationStatus) {
-    res.error = '';
-  }
 }
