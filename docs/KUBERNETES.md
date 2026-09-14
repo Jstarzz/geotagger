@@ -4,9 +4,9 @@
 
 A Kubernetes Pod is not a Docker container.
 
-A **container** is an isolated process environment created from an OCI image. A **Pod** is the Kubernetes scheduling/lifecycle/networking unit that owns one or more containers. Containers in the same Pod share the Pod network namespace, IP address and selected volumes.
+A **container** is an isolated process environment created from an OCI image. A **Pod** is the Kubernetes scheduling, lifecycle and networking unit that owns one or more containers. Containers in one Pod share its network namespace, IP address and selected volumes.
 
-K3s uses **containerd** as the runtime. Docker is not required on the node to run GeoTagger workloads. Images built with Docker still work because they are OCI-compatible.
+K3s uses **containerd** as the runtime. Docker is not required on the K3s node. Images built with Docker still work because they are OCI-compatible.
 
 ```mermaid
 flowchart TB
@@ -14,22 +14,20 @@ flowchart TB
     CTR --> PROC["Linux process"]
 ```
 
-For GeoTagger, most Pods contain one long-running application container. The API Pod also has a short-lived init container.
+The API Pod contains a short-lived init container plus the long-running API container:
 
 ```mermaid
 flowchart LR
-    POD["API Pod"] --> INIT["init container: wait-for-mmdb"]
-    INIT -->|"both DBs exist"| API["main container: GeoTagger API"]
+    POD["API Pod"] --> INIT["init: wait-for-mmdb"]
+    INIT -->|"active bundle ready"| API["GeoTagger API container"]
 ```
 
 The init container waits for:
 
 ```text
-/data/GeoLite2-City.mmdb
-/data/GeoLite2-ASN.mmdb
+/data/current/GeoLite2-City.mmdb
+/data/current/GeoLite2-ASN.mmdb
 ```
-
-before the API process starts.
 
 ## Runtime stack
 
@@ -45,61 +43,57 @@ Physical hardware
                 -> Linux processes
 ```
 
-Proxmox manages the VM. K3s/Kubernetes manages the application workloads inside the VM.
+Proxmox manages the VM. K3s manages the application workloads inside the VM.
 
-## Namespace
+## Namespace and resource map
 
-All application resources live in:
+Everything runs in:
 
 ```text
 namespace: geotagger
 ```
 
-Useful command:
+```mermaid
+flowchart TB
+    NS["Namespace: geotagger"] --> API_DEP["Deployment: geotagger-api"]
+    API_DEP --> API_PODS["2 to 8 API Pods"]
+    HPA["HorizontalPodAutoscaler"] --> API_DEP
+    API_SVC["Service: geotagger"] --> API_PODS
+
+    NS --> WORKER_DEP["Deployment: audit worker"]
+    NS --> NATS_SS["StatefulSet: nats"]
+    NS --> CH_SS["StatefulSet: clickhouse"]
+    NS --> CFD_DEP["Deployment: cloudflared"]
+    NS --> MMDB_JOB["Job: MMDB bootstrap"]
+    NS --> MMDB_CRON["CronJob: MMDB update"]
+```
+
+Useful overview:
 
 ```bash
 kubectl -n geotagger get all
 ```
 
-## Resource map
+## API Deployment and ReplicaSets
 
-```mermaid
-flowchart TB
-    NS["Namespace: geotagger"] --> API_DEP["Deployment: geotagger-api"]
-    API_DEP --> API_PODS["2 to 8 API Pods"]
-    HPA["HPA"] --> API_DEP
-    API_SVC["Service: geotagger"] --> API_PODS
-
-    NS --> WORKER_DEP["Deployment: geotagger-audit-worker"]
-    WORKER_DEP --> WORKER["Audit worker Pod"]
-
-    NS --> NATS_SS["StatefulSet: nats"]
-    NATS_SS --> NATS_POD["nats-0"]
-    NATS_POD --> NATS_PVC["NATS persistent volume"]
-
-    NS --> CH_SS["StatefulSet: clickhouse"]
-    CH_SS --> CH_POD["clickhouse-0"]
-    CH_POD --> CH_PVC["ClickHouse persistent volume"]
-
-    NS --> CFD_DEP["Deployment: cloudflared"]
-    NS --> MMDB_JOB["Bootstrap Job"]
-    NS --> MMDB_CRON["Daily MMDB CronJob"]
-```
-
-## Deployment
-
-A Deployment expresses desired stateless workload state.
-
-For the API, Kubernetes is told:
+A Deployment states the desired stateless workload:
 
 ```text
-run at least 2 API Pods
-allow the HPA to scale to 8
-keep replacing failed Pods
-roll out new image/config versions safely
+keep at least 2 API Pods
+allow HPA scale-out to 8
+replace failed Pods
+perform rolling updates
 ```
 
-The API has no request state that must survive a Pod replacement. Its required lookup data lives on the node-local MMDB volume and its audit dependency is NATS.
+The Deployment creates ReplicaSets, and ReplicaSets create Pods.
+
+```text
+Deployment
+  -> ReplicaSet
+    -> API Pod
+    -> API Pod
+    -> more API Pods when HPA scales
+```
 
 Inspect:
 
@@ -109,23 +103,9 @@ kubectl -n geotagger get pods -l app=geotagger-api
 kubectl -n geotagger describe deployment geotagger-api
 ```
 
-## ReplicaSet
-
-The Deployment controller creates ReplicaSets, which create Pods.
-
-```text
-Deployment
-  -> ReplicaSet
-    -> API Pod
-    -> API Pod
-    -> additional Pods when HPA scales
-```
-
-You generally operate the Deployment rather than manually managing ReplicaSets.
-
 ## Horizontal Pod Autoscaler
 
-Current API HPA:
+Current values:
 
 ```text
 minReplicas: 2
@@ -136,15 +116,11 @@ CPU limit: 2 cores per Pod
 scale-down stabilization: 300 seconds
 ```
 
-Kubernetes calculates HPA CPU utilization against the **CPU request**.
-
-At the current values, the target is approximately:
+Kubernetes calculates HPA CPU utilization against the **request**, so the target is roughly:
 
 ```text
 750m * 0.65 = 487.5m CPU per API Pod
 ```
-
-As average API utilization rises, the HPA changes the desired replica count.
 
 ```mermaid
 flowchart LR
@@ -154,7 +130,7 @@ flowchart LR
     PODS --> SVC["geotagger Service"]
 ```
 
-Inspect autoscaling:
+Inspect:
 
 ```bash
 kubectl -n geotagger get hpa
@@ -163,60 +139,31 @@ kubectl -n geotagger top pods
 kubectl top nodes
 ```
 
-### What autoscaling can and cannot do
+All replicas still share one 9-vCPU VM. HPA can consume spare CPU; it cannot create new hardware capacity or survive loss of the VM/host.
 
-All API replicas currently run on one 9-vCPU VM.
+## Kubernetes Services
 
-HPA can:
-
-```text
-use spare CPU by running more API processes
-reduce per-Pod load
-improve burst handling
-keep two warm replicas
-```
-
-HPA cannot:
-
-```text
-create more physical CPU
-survive failure of the one VM/host
-turn one node into hardware HA
-```
-
-Once the VM is saturated, extra Pods may only increase scheduling contention.
-
-## Service
-
-Pod IP addresses are disposable. Kubernetes Services provide stable internal addressing.
-
-Public API Service:
+Pod IPs are disposable. Services provide stable internal addressing.
 
 ```text
 geotagger:8080
-geotagger.geotagger.svc.cluster.local:8080
+nats:4222
+clickhouse:8123
 ```
 
-Cloudflared sends traffic to the Service, not to a specific API Pod.
+Cloudflared connects to the API Service, not a specific Pod:
 
 ```mermaid
 flowchart LR
     CFD["cloudflared"] --> SVC["geotagger Service"]
     SVC --> P1["ready API Pod"]
     SVC --> P2["ready API Pod"]
-    SVC --> PN["other ready API Pods"]
+    SVC --> PN["other ready Pods"]
 ```
 
-Internal stateful service names:
+## Readiness and liveness
 
-```text
-nats:4222
-clickhouse:8123
-```
-
-## Readiness and liveness probes
-
-The API has an internal administrative listener on port 9090.
+The API administrative listener is internal on port 9090:
 
 ```text
 GET /healthz
@@ -224,30 +171,22 @@ GET /readyz
 GET /metrics
 ```
 
-### Liveness
+**Liveness** decides whether Kubernetes should restart the container.
 
-Liveness asks whether the process should be restarted.
+**Readiness** decides whether a running Pod should receive new Service traffic.
 
-Repeated failure causes Kubernetes to restart the container.
+GeoTagger readiness includes audit-transport health, so an API Pod that cannot reach the required NATS path should not continue receiving ordinary lookup traffic.
 
-### Readiness
-
-Readiness asks whether the Pod should receive new Service traffic.
-
-If readiness fails, the Pod can remain running while being removed from Service endpoints.
-
-For GeoTagger, readiness includes audit-transport health. A Pod that cannot communicate with the required NATS path should not continue receiving normal public traffic.
-
-Inspect endpoints:
+Inspect:
 
 ```bash
 kubectl -n geotagger get endpoints geotagger
 kubectl -n geotagger describe pod <api-pod>
 ```
 
-## StatefulSet
+## StatefulSets and PVCs
 
-NATS and ClickHouse are stateful services.
+NATS and ClickHouse are stateful:
 
 ```text
 StatefulSet/nats
@@ -259,39 +198,51 @@ StatefulSet/clickhouse
   -> persistent volume
 ```
 
-A Pod may be recreated while its persistent volume survives.
-
-This is different from the API Deployment, where no request-specific disk state needs to follow the Pod.
-
-## PersistentVolumeClaim
-
-PVCs provide durable storage claims for stateful workloads.
+A stateful Pod can be recreated while its volume survives.
 
 Inspect:
 
 ```bash
+kubectl -n geotagger get statefulset
 kubectl -n geotagger get pvc
 kubectl -n geotagger describe pvc
 ```
 
-Current state includes persistent storage for:
-
-```text
-NATS JetStream
-ClickHouse
-```
-
-The City and ASN MMDB files are instead stored in a node-local host path:
+The MMDB data uses a node-local host path rather than a PVC:
 
 ```text
 /var/lib/geotagger/mmdb
 ```
 
-and mounted read-only by the API Pods.
+The whole directory is mounted read-only at `/data` inside API Pods.
 
-## MMDB bootstrap Job
+## Atomic MMDB bundle layout
 
-Before API rollout, `scripts/deploy-k3s.sh` runs:
+City and ASN are activated as one generation:
+
+```text
+/var/lib/geotagger/mmdb/
+├── current -> releases/release-<generation>/
+└── releases/
+    ├── release-<older>/
+    ├── release-<previous>/
+    └── release-<current>/
+        ├── GeoLite2-City.mmdb
+        └── GeoLite2-ASN.mmdb
+```
+
+API Pods read:
+
+```text
+/data/current/GeoLite2-City.mmdb
+/data/current/GeoLite2-ASN.mmdb
+```
+
+The updater retains the three newest complete release directories.
+
+## Bootstrap Job
+
+Before the API rollout, `scripts/deploy-k3s.sh` creates:
 
 ```text
 Job/geotagger-mmdb-bootstrap
@@ -299,16 +250,32 @@ Job/geotagger-mmdb-bootstrap
 
 The Job:
 
-1. prepares ownership on the node-local MMDB directory;
-2. downloads GeoLite2 City;
-3. downloads GeoLite2 ASN;
-4. fsyncs and verifies both staged databases;
-5. replaces live files using atomic renames; and
-6. exits successfully.
+1. prepares ownership of the MMDB host directory;
+2. creates a new staging release directory;
+3. downloads GeoLite2 City;
+4. downloads GeoLite2 ASN;
+5. fsyncs and verifies both databases;
+6. publishes the complete release directory;
+7. atomically replaces the one `current` symlink; and
+8. exits successfully.
 
-Only after the Job completes does the normal Kustomize deployment proceed.
+Only after the bootstrap succeeds does the normal Kustomize rollout proceed.
 
-This prevents new API Pods from starting with missing lookup data.
+```mermaid
+sequenceDiagram
+    participant D as deploy-k3s.sh
+    participant J as Bootstrap Job
+    participant M as MaxMind
+    participant F as MMDB host directory
+    participant A as API Deployment
+    D->>J: create bootstrap Job
+    J->>M: download City + ASN
+    J->>J: verify complete bundle
+    J->>F: atomic current symlink switch
+    J-->>D: complete
+    D->>A: apply API Deployment
+    A->>F: wait for current City + ASN
+```
 
 Inspect:
 
@@ -327,59 +294,61 @@ schedule: 17 3 * * *
 concurrencyPolicy: Forbid
 ```
 
-The updater uses:
+Environment:
 
 ```text
 MAXMIND_EDITIONS=GeoLite2-City,GeoLite2-ASN
 MMDB_DIR=/data
+MAXMIND_LICENSE_KEY=<secretKeyRef>
 ```
-
-and the existing `MAXMIND_LICENSE_KEY` secret.
 
 ```mermaid
 flowchart LR
     CRON["Daily CronJob"] --> JOB["Updater Pod"]
-    JOB --> CITY["Stage + verify City"]
-    JOB --> ASN["Stage + verify ASN"]
-    CITY --> LIVE["Atomic live-file replacement"]
-    ASN --> LIVE
-    LIVE --> API["API hot reload"]
+    JOB --> STAGE["Stage City + ASN generation"]
+    STAGE --> VERIFY["fsync + verify both"]
+    VERIFY --> RELEASE["Publish complete release"]
+    RELEASE --> SWITCH["Atomic current symlink swap"]
+    SWITCH --> API["API hot reload"]
 ```
 
-All requested databases are staged and verified before live replacement begins. Each individual final rename is atomic.
+This is bundle-atomic activation: readers see the old complete generation or the new complete generation. They do not observe a half-updated City/ASN pair.
 
-Inspect:
+Manual refresh:
 
 ```bash
-kubectl -n geotagger get cronjob
-kubectl -n geotagger get jobs --sort-by=.metadata.creationTimestamp
-kubectl -n geotagger logs job/<update-job>
+kubectl -n geotagger create job \
+  --from=cronjob/geotagger-mmdb-update \
+  geotagger-mmdb-manual-$(date +%s)
 ```
 
-Manual refresh when needed:
+Inspect active generation:
 
 ```bash
-kubectl -n geotagger create job --from=cronjob/geotagger-mmdb-update geotagger-mmdb-manual-$(date +%s)
+readlink -f /var/lib/geotagger/mmdb/current
+ls -lh /var/lib/geotagger/mmdb/current/
+ls -1 /var/lib/geotagger/mmdb/releases/
 ```
 
-## Hot reload
+## API hot reload
 
-Each API process keeps two long-lived memory-mapped readers:
+Each API process maintains two long-lived memory-mapped readers. Every `MMDB_RELOAD_INTERVAL`, it stats the files reached through `current`.
+
+After a bundle switch:
 
 ```text
-GeoLite2-City.mmdb
-GeoLite2-ASN.mmdb
+current points to new release
+-> file metadata changes
+-> API opens and verifies changed reader(s)
+-> swaps reader(s) under lock
+-> closes old reader(s)
 ```
 
-Every configured reload interval, the API checks file modification times. Changed databases are opened and verified first, then swapped under a lock. Existing readers are closed only after the replacement is installed.
-
-The API does not need to restart after a successful MMDB refresh.
-
-Source metadata returned by `/v1/lookup` exposes the build/version of each database actually used.
+No Pod restart is required. Rich responses expose the City and ASN build metadata actually loaded by the process.
 
 ## Secrets
 
-The Kubernetes Secret contains runtime values such as:
+`geotagger-secrets` contains values such as:
 
 ```text
 API_KEYS
@@ -389,24 +358,20 @@ CLICKHOUSE_PASSWORD
 CLOUDFLARE_TUNNEL_TOKEN
 ```
 
-Pods reference keys using `secretKeyRef`; plaintext values are not embedded in committed manifests.
+Pods use `secretKeyRef`; plaintext production secrets are not committed in manifests.
 
-Inspect metadata without printing secret values:
+Inspect metadata without dumping secret values:
 
 ```bash
 kubectl -n geotagger get secret geotagger-secrets
 kubectl -n geotagger describe secret geotagger-secrets
 ```
 
-Do not use `kubectl get secret ... -o yaml` casually on shared terminals/logged sessions.
-
-K3s secrets encryption at rest should be enabled for the production cluster.
+K3s secrets encryption at rest should be enabled in production.
 
 ## NetworkPolicy
 
-The namespace uses default-deny ingress and explicit allow rules.
-
-Expected flows:
+The namespace has default-deny ingress plus explicit permitted flows:
 
 ```text
 cloudflared -> API        :8080
@@ -423,7 +388,7 @@ flowchart LR
     WORKER -->|"8123"| CH["ClickHouse"]
 ```
 
-The current policy is ingress-focused. A future default-deny egress policy must preserve cluster DNS plus the outbound paths needed by cloudflared and the MaxMind updater.
+A future default-deny egress policy must preserve cluster DNS, Cloudflare tunnel traffic and the MaxMind updater's HTTPS access.
 
 ## SecurityContext
 
@@ -446,11 +411,9 @@ runAsUser: 1000
 runAsGroup: 1000
 ```
 
-The explicit numeric identities avoid the deployment bug where Kubernetes could not prove that an image's named/default user was non-root.
+The explicit numeric identities prevent the Kubernetes admission failure previously seen when `runAsNonRoot: true` was set without a verifiable numeric runtime UID.
 
-## Rolling updates
-
-A Deployment update creates replacement Pods and waits for readiness before removing old replicas.
+## Rolling API updates
 
 ```mermaid
 sequenceDiagram
@@ -459,65 +422,43 @@ sequenceDiagram
     participant N as New API Pod
     participant S as Service
     D->>N: create new Pod
-    N->>N: wait for City + ASN MMDBs
+    N->>N: wait for active MMDB bundle
     N->>N: start API
     N-->>D: readiness succeeds
     S->>N: add endpoint
     D->>O: terminate old Pod
-    S-->>O: remove endpoint
+    S-->>O: remove old endpoint
 ```
 
-With a minimum of two API replicas, normal rolling replacement has more room to avoid a single-process cold-start window.
+With a minimum of two API replicas, normal rollouts have more room to avoid a single-process cold-start window.
 
 ## Logs
 
-API logs:
-
 ```bash
 kubectl -n geotagger logs deployment/geotagger-api --tail=200
+kubectl -n geotagger logs deployment/geotagger-audit-worker --tail=200
+kubectl -n geotagger logs statefulset/nats --tail=200
+kubectl -n geotagger logs statefulset/clickhouse --tail=200
 ```
 
-Follow:
+Follow API logs:
 
 ```bash
 kubectl -n geotagger logs deployment/geotagger-api -f
 ```
 
-Worker:
-
-```bash
-kubectl -n geotagger logs deployment/geotagger-audit-worker --tail=200
-```
-
-NATS:
-
-```bash
-kubectl -n geotagger logs statefulset/nats --tail=200
-```
-
-ClickHouse:
-
-```bash
-kubectl -n geotagger logs statefulset/clickhouse --tail=200
-```
-
 ## Port forwarding
 
-Public API Service through an administrator-local port:
+API Service:
 
 ```bash
 kubectl -n geotagger port-forward svc/geotagger 18080:8080
 ```
 
-Internal admin listener:
+Admin listener:
 
 ```bash
 kubectl -n geotagger port-forward deployment/geotagger-api 19090:9090
-```
-
-Then:
-
-```bash
 curl -fsS http://127.0.0.1:19090/readyz
 curl -fsS http://127.0.0.1:19090/metrics
 ```
@@ -542,47 +483,49 @@ kubectl top nodes
 
 ```text
 Pod failure
--> ReplicaSet sees desired replicas are missing
+-> ReplicaSet notices desired replicas missing
 -> replacement Pod created
--> init waits for City + ASN
+-> init waits for current bundle
 -> API starts
--> readiness succeeds
+-> readiness passes
 -> Service routes traffic
 ```
+
+### MMDB update fails before activation
+
+```text
+download / fsync / Verify fails
+-> updater exits non-zero
+-> current symlink remains unchanged
+-> API continues on old complete City+ASN generation
+```
+
+### MMDB updater dies after activation
+
+The `current` rename is the commit point. Once it succeeds, it already references a complete verified release directory. A crash after that point leaves the new complete generation active.
 
 ### ClickHouse dies
 
 ```text
 worker insert fails
--> messages are not successfully ACKed
+-> messages are not ACKed
 -> JetStream retains/redelivers work
--> API can continue only while NATS still accepts required audit events
 ```
 
 ### NATS dies
 
 ```text
-API cannot obtain required durable publish ACK
--> readiness can fail
--> normal audited success is not returned
-```
-
-### MMDB update fails
-
-```text
-download or verification fails
--> updater exits non-zero
--> existing live City/ASN files remain
--> API continues using current readers
+API cannot obtain durable audit publish ACK
+-> readiness/normal lookup path fails closed
 ```
 
 ### Entire VM dies
 
-Kubernetes inside that VM cannot recover the service elsewhere because this is a one-node cluster. Proxmox/infrastructure recovery is required.
+This is a one-node cluster. Kubernetes cannot reschedule the workloads elsewhere; Proxmox/infrastructure recovery is required.
 
 ## Scaling beyond one node
 
-A future multi-node design could schedule API replicas across separate hosts:
+A future multi-node design could place API Pods on separate hosts:
 
 ```mermaid
 flowchart TB
@@ -594,4 +537,4 @@ flowchart TB
     N3 --> A3["API Pod"]
 ```
 
-That would require redesigning node-local MMDB distribution and planning replicated/remote state for NATS and ClickHouse. Simply adding a node without solving those state/data-placement questions does not provide complete HA.
+That would require a deliberate strategy for distributing the MMDB bundle to each node plus replicated/remote state for NATS and ClickHouse. Merely adding worker nodes does not make the current stateful design highly available.
