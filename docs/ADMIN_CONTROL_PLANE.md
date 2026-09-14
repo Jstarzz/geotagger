@@ -2,34 +2,40 @@
 
 ## Status
 
-This document defines the security and operational contract for the GeoTagger human-administration surface **before implementation**. The public machine API remains the production interface until the implementation described here is merged, deployed, and validated.
+The admin control plane is implemented in the application and Kubernetes manifests. It remains **disabled at the origin until Cloudflare Access configuration is supplied** and is not considered production-enabled until the Cloudflare setup and acceptance checks in this document are completed.
 
-Planned hostname:
+Target hostname:
 
 ```text
 https://admin.geo.itsjosiahdavis.dev
 ```
 
-The admin hostname is separate from the machine API at `https://geo.itsjosiahdavis.dev`.
+The machine API remains separate at:
 
-## Goals
+```text
+https://geo.itsjosiahdavis.dev
+```
 
-The control plane will replace manual day-to-day API-key lifecycle work with a small authenticated operator interface while preserving the current machine API contract.
+Do not put browser-oriented Cloudflare Access in front of the machine API hostname.
 
-Required first release:
+## What is implemented
 
-- list managed API credentials without exposing plaintext secrets;
-- create a credential and reveal the client token exactly once;
-- revoke a credential;
-- rotate a credential and reveal the replacement token exactly once;
-- record key metadata: ID, display name, owner/service, environment, created time, expiry and revocation state;
-- keep authentication verification in memory on the API hot path;
-- propagate managed-key changes to all API replicas without a Pod restart;
-- show service/MMDB health and the active City/ASN generation;
-- remain inaccessible unless the request passed the dedicated Cloudflare Access policy; and
-- keep health/readiness/metrics usable internally even when the human admin UI is disabled.
+The first control-plane release provides:
 
-The first release does not attempt to become a general Kubernetes or Proxmox administration console.
+- an embedded, dependency-free admin web UI on the existing internal admin listener (`:9090`);
+- origin validation of Cloudflare Access JWTs (`Cf-Access-Jwt-Assertion`);
+- managed API-key create, rotate, revoke and expiry state;
+- one-time plaintext token display for create/rotate operations;
+- metadata for key ID, display name, owner/service, environment, timestamps and revocation reason;
+- NATS JetStream Key/Value persistence for managed credentials;
+- in-memory API verification, so normal lookups do not query NATS;
+- cross-replica credential propagation through a KV watcher;
+- compatibility with the existing static `API_KEYS` break-glass credentials;
+- key/store/audit/MMDB status in the dashboard;
+- a dedicated `geotagger-admin` ClusterIP service on port 9090; and
+- NetworkPolicy ingress from the `cloudflared` Pod to ports 8080 and 9090 only.
+
+The first release deliberately does **not** expose Kubernetes, Proxmox, ClickHouse or NATS administration in the browser.
 
 ## Trust boundaries
 
@@ -38,139 +44,196 @@ flowchart LR
     HUMAN["Named administrator"] -->|"HTTPS + MFA"| ACCESS["Cloudflare Access"]
     ACCESS --> TUNNEL["Cloudflare Tunnel"]
     TUNNEL --> CFD["cloudflared Pod"]
-    CFD --> ADMIN["Admin Service :9090"]
-    ADMIN --> API["GeoTagger admin handler"]
-    API --> KV["NATS JetStream KV: API-key metadata + digests"]
+    CFD --> ADMINSVC["geotagger-admin Service :9090"]
+    ADMINSVC --> ADMIN["Admin handler"]
+    ADMIN -->|"validated Access JWT"| UI["Embedded admin UI/API"]
+    UI --> KV["NATS JetStream KV"]
 
     MACHINE["Machine client"] --> EDGE["Cloudflare public API"]
     EDGE --> CFD
-    CFD --> PUB["GeoTagger Service :8080"]
-    PUB --> LOOKUP["API handler"]
+    CFD --> PUB["geotagger Service :8080"]
+    PUB --> LOOKUP["Lookup handler"]
     LOOKUP --> CACHE["in-memory credential verifier"]
     KV -->|"snapshot + watch"| CACHE
 ```
 
-The public API and admin hostname are intentionally separate. Cloudflare Access must apply to the admin hostname only; putting browser-oriented Access in front of the machine API would break service-to-service callers.
+The control plane has two independent authorization layers:
+
+1. Cloudflare Access decides whether a browser/user may reach the protected hostname.
+2. GeoTagger validates the Access JWT at the origin, including signature, issuer, audience and expiry.
+
+A spoofed email header alone is not accepted.
 
 ## Human authentication
 
-Cloudflare Access is the primary interactive identity boundary for the admin hostname.
+Cloudflare Access is the interactive identity boundary for the admin hostname. GeoTagger expects Cloudflare to send the signed Access assertion in:
 
-Required Cloudflare-side controls:
+```text
+Cf-Access-Jwt-Assertion
+```
 
-- a dedicated self-hosted Access application for `admin.geo.itsjosiahdavis.dev`;
-- an allow policy limited to named administrators or an approved identity-provider group;
-- MFA required by the identity provider / Access policy, with phishing-resistant WebAuthn/passkeys/security keys preferred where available;
-- no broad `Everyone` allow rule; and
-- a short, documented session lifetime appropriate for privileged administration.
-
-The origin must not trust an arbitrary email header by itself. The implementation should validate the Cloudflare Access JWT (`Cf-Access-Jwt-Assertion`) against the configured Access issuer and application audience before serving privileged routes.
-
-Planned runtime configuration:
+Origin validation requires both runtime values:
 
 ```text
 CF_ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com
 CF_ACCESS_AUD=<Access application audience tag>
 ```
 
-If those values are absent or invalid, privileged admin routes fail closed. Internal `/healthz`, `/readyz`, and `/metrics` remain separate from the human UI authorization path.
+The application fetches the team's Access signing keys from:
+
+```text
+https://<team>.cloudflareaccess.com/cdn-cgi/access/certs
+```
+
+and validates RS256 signatures, issuer, audience, expiry and not-before claims. Signing keys are cached and refreshed when needed.
+
+If either Access setting is absent, both must be absent; the application still serves internal health/readiness/metrics, but `/admin/...` returns a fail-closed configuration error. If a request reaches the admin origin without a valid Access assertion, privileged routes return `401`.
+
+Recommended Cloudflare/IdP policy:
+
+- dedicated self-hosted Access application for `admin.geo.itsjosiahdavis.dev`;
+- named administrator(s) or an approved IdP group only;
+- MFA required by the IdP/policy;
+- phishing-resistant WebAuthn/passkeys/security keys preferred where available;
+- no `Everyone` allow policy; and
+- a short privileged-session lifetime appropriate to the organization.
 
 ## Credential model
 
-Client token format remains compatible with the current API:
+Machine tokens retain the existing format:
 
 ```text
 <key-id>.<secret>
 ```
 
-Creation/rotation uses 32 cryptographically random bytes encoded with unpadded Base64URL. Only a SHA-256 digest of the secret is stored server-side.
+For managed credentials, GeoTagger generates 32 cryptographically random bytes and encodes them as unpadded Base64URL. Only this value is returned to the administrator:
 
-Managed record shape:
+```text
+ndhis-prod.<one-time-secret>
+```
+
+The persistent record contains only the SHA-256 digest of the secret plus lifecycle metadata:
 
 ```json
 {
   "id": "ndhis-prod",
-  "secret_sha256": "<64 hex chars>",
+  "secret_sha256": "<64 hex characters>",
   "display_name": "NDHIS production",
   "owner": "NDHIS",
   "environment": "production",
   "created_at": "2026-09-14T17:00:00Z",
+  "rotated_at": null,
   "expires_at": null,
   "revoked_at": null,
   "revocation_reason": ""
 }
 ```
 
-Plaintext secrets are never written to NATS, ClickHouse, logs, metrics, Kubernetes Secrets, or browser storage by GeoTagger. A newly generated token is returned only in the create/rotate response and the UI treats it as one-time material.
+Plaintext secrets are not written by GeoTagger to NATS, ClickHouse, application logs, metrics or Kubernetes Secrets. Create/rotate responses deliberately use `Cache-Control: no-store`, and the UI removes the displayed token from page state when dismissed or the page is left.
+
+A browser/network inspector may still observe a token at the moment it is intentionally returned to the authorized administrator. Treat the admin workstation and browser session as privileged.
 
 ## Managed-key storage
 
-Managed credentials will use a dedicated NATS JetStream Key/Value bucket backed by file storage. This reuses the already-required persistent NATS failure domain instead of adding Redis or a new relational database solely for credential metadata.
-
-Target bucket:
+Managed credentials use a dedicated NATS JetStream Key/Value bucket:
 
 ```text
 GEOTAGGER_API_KEYS
 ```
 
-The API does **not** query NATS on every lookup. Each API process:
+Properties created by GeoTagger:
 
-1. loads a snapshot of managed key records at startup;
-2. builds an in-memory verifier keyed by key ID;
-3. watches the KV bucket for updates/deletes; and
-4. atomically refreshes its in-memory credential map when a valid update arrives.
+```text
+storage: FileStorage
+history: 5 revisions per key
+replicas: 1
+max bytes: 64 MiB
+```
 
-Authentication therefore remains an in-process hash/constant-time comparison on the request hot path.
+The bucket uses the existing NATS persistent volume/failure domain. This avoids introducing Redis or another database just for credential metadata.
 
-## Bootstrap / break-glass credentials
+Two API Pods may race to provision the bucket during the first rollout. Provisioning is race-tolerant: a losing Pod binds to the bucket created by the other Pod rather than failing solely because it lost the creation race.
 
-The existing `API_KEYS` Kubernetes Secret remains supported initially as a compatibility and break-glass source.
+## Hot-path behavior
+
+The machine API does **not** query NATS for every request.
+
+Each API process:
+
+1. opens the managed-key KV bucket;
+2. starts a `WatchAll` snapshot/watch;
+3. builds an in-memory managed-key map after the initial snapshot;
+4. merges that map logically with static break-glass keys; and
+5. atomically replaces the managed verifier map when KV updates arrive.
+
+Bearer verification remains an in-process SHA-256 + constant-time comparison.
+
+The API readiness path treats managed-key synchronization as a required runtime dependency after synchronization starts. If the watcher becomes unhealthy, readiness degrades rather than silently claiming the authorization state is current.
+
+## Static break-glass credentials
+
+The existing `API_KEYS` Kubernetes Secret remains required for the first release and acts as compatibility/break-glass authentication.
 
 Rules:
 
-- static bootstrap keys are not displayed by the dashboard;
-- managed keys live in JetStream KV and can be created/revoked/rotated through the admin UI;
-- key IDs must be unique across static and managed sources;
-- a collision is a startup/readiness error rather than an ambiguous override;
-- removing the last static break-glass key is a later migration decision, not part of the first release.
+- static credentials are not listed in the dashboard;
+- they continue to authenticate the public API unchanged;
+- dashboard-created IDs cannot collide with a static ID;
+- managed/static collisions discovered while loading persistent state fail verification/synchronization rather than choosing an ambiguous winner; and
+- removing the last static break-glass credential is a later migration decision.
 
-This allows the existing deployed token to continue working during rollout while new integrations can move to managed credentials.
+This allows the existing production token to keep working while new integrations move to managed credentials.
 
 ## Key lifecycle
 
 ### Create
 
-The operator provides metadata and a unique key ID. GeoTagger generates the secret server-side, stores only its digest, then returns:
+The operator supplies a unique ID and optional metadata. GeoTagger generates the secret at the origin and returns it once.
+
+Example response shape:
 
 ```json
 {
-  "id": "ndhis-prod",
+  "key": {
+    "id": "ndhis-prod",
+    "owner": "NDHIS",
+    "environment": "production",
+    "status": "active"
+  },
   "token": "ndhis-prod.<one-time-secret>"
 }
 ```
 
-The token is not retrievable later.
-
-### Revoke
-
-Revocation sets `revoked_at` and an optional reason. API replicas remove the credential from their active verifier after the KV update is observed. A revoked token must return `401`.
+A static-ID collision is rejected before a persistent managed record is created.
 
 ### Rotate
 
-Rotation generates a fresh secret for the same key ID and replaces the stored digest while retaining identity/ownership metadata. The old secret becomes invalid after the update reaches API replicas. The replacement token is shown once.
+Rotation replaces the stored digest for the same managed key ID and records `rotated_at`. The old secret becomes invalid after the KV update reaches each API replica. The replacement plaintext token is returned once.
 
-For callers that require overlap during migration, create a second key ID, deploy it to the client, verify traffic, then revoke the old key.
+If a caller requires an overlap window, create a second ID, deploy it to the caller, verify traffic, then revoke the old ID instead of rotating in place.
+
+### Revoke
+
+Revocation records `revoked_at` plus an optional reason. A revoked managed token returns `401` once the update has propagated. A repeated revoke is idempotent.
 
 ### Expiry
 
-If `expires_at` is set, authentication rejects the credential at or after that time even if the KV record remains present. Expired credentials remain visible to administrators until explicitly removed or archived.
+If `expires_at` is set, the in-memory verifier rejects the credential at or after that UTC time even though its metadata remains in the KV bucket and dashboard.
 
-## Admin API surface
+### Propagation warnings
 
-Planned privileged endpoints on port 9090:
+Create/rotate/revoke are persisted in JetStream KV first. The serving Pod then refreshes its local verifier immediately while all Pods also receive the watch event.
+
+If the durable mutation succeeds but that immediate local refresh fails, the admin API does **not** discard a newly generated plaintext token behind an error response. Instead it returns the successful mutation with an explicit warning. The administrator should treat dashboard/readiness as degraded until synchronization recovers.
+
+## Admin routes
+
+Privileged routes on the internal `:9090` listener:
 
 ```text
 GET    /admin/
+GET    /admin/assets/app.js
+GET    /admin/assets/style.css
 GET    /admin/api/session
 GET    /admin/api/status
 GET    /admin/api/keys
@@ -179,109 +242,124 @@ POST   /admin/api/keys/{id}/rotate
 POST   /admin/api/keys/{id}/revoke
 ```
 
-Mutating endpoints accept JSON only, enforce strict body limits/unknown-field rejection, and require the validated Access session.
-
-Browser security requirements:
-
-- no credential token in a URL;
-- `Cache-Control: no-store` on admin HTML/API responses that can contain sensitive material;
-- restrictive CSP and frame protections;
-- same-origin requests only;
-- no third-party analytics/scripts; and
-- one-time token values cleared from UI state when dismissed/reloaded.
-
-## Admin status view
-
-The first dashboard status page should show operational facts already available to the API process, for example:
+Operational routes remain internal on the same listener and are not themselves part of the web UI:
 
 ```text
-API process readiness
-NATS connectivity
-active City database version
-active ASN database version
-managed credential count
-active / revoked / expired counts
-current server time
+GET /healthz
+GET /readyz
+GET /metrics
 ```
 
-Historical traffic analytics remain a separate concern. The first release should not grant the web process broader ClickHouse privileges merely to make a prettier dashboard. Caller activity can continue to be investigated through the existing audit store until a dedicated read-only analytics identity is defined.
+The dedicated tunnel hostname should route to `/admin/...` through the admin service; do not publish NATS or ClickHouse.
+
+## Browser protections
+
+Admin responses set:
+
+```text
+Cache-Control: no-store
+Pragma: no-cache
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: no-referrer
+restrictive Content-Security-Policy
+restrictive Permissions-Policy
+```
+
+The UI has no third-party scripts, fonts, analytics or API dependencies.
+
+Mutating requests additionally require:
+
+```text
+X-GeoTagger-Admin-CSRF: 1
+```
+
+and cross-site `Sec-Fetch-Site` values are rejected. Mutation bodies must be `application/json`, are size-limited, reject unknown JSON fields and allow only a single JSON object.
 
 ## Kubernetes exposure
 
-The public `geotagger` Service continues to expose only port 8080.
+Public machine API:
 
-A dedicated ClusterIP service will expose the admin listener:
+```text
+geotagger.geotagger.svc.cluster.local:8080
+```
+
+Human admin surface:
 
 ```text
 geotagger-admin.geotagger.svc.cluster.local:9090
 ```
 
-NetworkPolicy should permit:
+Both Services select the same API Pods, but the public service does not expose port 9090. The namespace default-deny ingress policy remains in place, with explicit ingress from the `cloudflared` Pod to API ports 8080 and 9090.
 
-```text
-cloudflared -> API Pods TCP 8080   # public machine API
-cloudflared -> API Pods TCP 9090   # admin hostname only
-```
+NATS and ClickHouse remain ClusterIP-only and are not routed through either public hostname directly.
 
-NATS and ClickHouse remain ClusterIP-only and are never routed through the admin hostname.
-
-The Cloudflare Tunnel then receives two hostname mappings:
+Expected tunnel mappings:
 
 ```text
 geo.itsjosiahdavis.dev       -> http://geotagger.geotagger.svc.cluster.local:8080
 admin.geo.itsjosiahdavis.dev -> http://geotagger-admin.geotagger.svc.cluster.local:9090
 ```
 
-The second mapping must not be considered secure until the Access application/policy is active and origin JWT validation is configured.
+The admin hostname is not considered secure merely because it is a Tunnel route. The Access application/policy and origin JWT configuration are required.
 
-## Audit behavior
+## Administrative logs
 
-Machine lookup auditing remains unchanged.
-
-Administrative credential mutations should emit structured application logs containing non-secret metadata such as:
+Credential mutations emit structured application log metadata containing:
 
 ```text
-admin identity
+admin_email
 operation
-key ID
-timestamp
+key_id
 outcome
 ```
 
-Never log the generated plaintext token or stored digest. A later iteration can add a dedicated immutable admin-audit stream if the organizational requirement justifies it.
+The generated token and stored secret digest are intentionally omitted.
+
+Machine lookup auditing in NATS -> ClickHouse is unchanged. The first admin release does not yet add a separate immutable admin-event stream; structured application logs are therefore an explicitly documented residual control gap if long-term immutable admin-action evidence is required.
 
 ## Failure behavior
 
-| Failure | Required behavior |
+| Failure | Behavior |
 |---|---|
-| Access JWT missing/invalid | privileged route returns `401`/`403` |
-| Access configuration absent | privileged routes fail closed |
-| NATS/KV unavailable at API startup | managed-key subsystem not considered ready; static break-glass behavior follows explicit implementation policy |
-| NATS/KV unavailable during create/revoke/rotate | mutation fails; UI reports no change |
-| malformed KV record | reject record, surface readiness/health error rather than accepting ambiguous auth state |
-| revoked/expired key | machine API returns `401` |
-| dashboard reload after creation | plaintext token cannot be recovered |
+| Access settings absent | `/admin/...` fails closed; health/readiness/metrics remain available internally |
+| Access assertion missing/invalid | privileged route returns `401` |
+| Access signing-key fetch fails | JWT validation fails closed |
+| NATS unavailable at API startup | API startup fails because audit/key-store dependencies cannot initialize |
+| managed-key initial snapshot fails/times out | API startup fails |
+| managed-key watcher becomes unhealthy | key-store health/readiness degrades |
+| mutation cannot be persisted | mutation fails and no success is reported |
+| mutation persists but immediate local refresh fails | mutation response includes a warning; one-time token is still returned if generated |
+| malformed KV record | verifier synchronization reports/fails rather than accepting ambiguous auth state |
+| revoked/expired managed key | public API returns `401` |
+| dashboard is reloaded after token creation | plaintext token cannot be recovered from GeoTagger |
 
 ## Deployment acceptance
 
-The admin control plane is not considered deployed until all of the following are proven:
+The admin control plane is not production-enabled until all of the following are demonstrated:
 
 ```text
-[ ] admin hostname routes only through Cloudflare Tunnel
-[ ] Cloudflare Access blocks an unauthenticated browser
-[ ] authorized administrator reaches dashboard
+[ ] admin hostname routes only through the Cloudflare Tunnel
+[ ] dedicated Cloudflare Access application protects admin.geo.itsjosiahdavis.dev
+[ ] no broad Everyone allow policy exists
+[ ] privileged identity uses MFA
+[ ] CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD are present in geotagger-secrets
+[ ] unauthenticated browser is stopped by Cloudflare Access
+[ ] authorized administrator reaches /admin/
 [ ] origin rejects a request without a valid Access JWT
-[ ] create shows token once
-[ ] created token authenticates machine API
-[ ] rotate invalidates previous secret and new token works
-[ ] revoke causes token to return 401
-[ ] API Pods receive key changes without restart
-[ ] static existing production token still works during migration
-[ ] admin responses use no-store and restrictive browser headers
-[ ] plaintext generated tokens are absent from logs and persistent stores
-[ ] public geo hostname remains usable by machine clients without interactive Access
+[ ] create shows a token once
+[ ] created token authenticates the public machine API
+[ ] rotate invalidates the old secret and the replacement works
+[ ] revoke makes the managed token return 401
+[ ] managed changes propagate across both API Pods without Pod restart
+[ ] existing static production token still works
+[ ] admin responses include no-store/CSP/frame protections
+[ ] plaintext generated tokens are absent from persistent stores and logs
+[ ] geo.itsjosiahdavis.dev remains usable by machine clients without interactive Access
 ```
+
+See `CLOUDFLARE_ADMIN_SETUP.md` for the Cloudflare-side rollout sequence.
 
 ## Compliance boundary
 
-The dashboard improves technical access control and credential lifecycle evidence; it does not by itself establish HIPAA compliance. Privileged-user enrollment, MFA policy, periodic access review, termination procedures, incident response, backup/recovery, vendor/BAA obligations and risk analysis remain organizational controls.
+The dashboard improves technical access control and credential-lifecycle evidence; it does not by itself establish HIPAA compliance. Privileged-user enrollment, MFA policy, access review, workforce termination procedures, incident response, backup/recovery, vendor/BAA obligations, risk analysis and periodic evaluation remain organizational responsibilities.
