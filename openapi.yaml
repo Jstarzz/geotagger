@@ -1,0 +1,368 @@
+openapi: 3.1.0
+info:
+  title: GeoTagger IP Intelligence API
+  version: 1.1.0
+  description: |
+    Self-hosted authenticated IP intelligence backed by local MaxMind GeoLite2
+    City and ASN databases. Normal successful lookups are returned only after
+    durable audit acceptance by NATS JetStream.
+
+    City, region and coordinates are IP-geolocation estimates, not GPS/device
+    location. Consumers should use `accuracy_radius_km` when presenting or
+    making decisions from location data.
+servers:
+  - url: https://geo.itsjosiahdavis.dev
+    description: Production/staging public endpoint
+security:
+  - bearerAuth: []
+tags:
+  - name: Intelligence
+  - name: Compatibility
+paths:
+  /v1/lookup:
+    post:
+      tags: [Intelligence]
+      summary: Look up full intelligence for an IP address
+      operationId: postLookup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LookupRequest'
+            examples:
+              googleDns:
+                value:
+                  ip: 8.8.8.8
+      responses:
+        '200':
+          $ref: '#/components/responses/LookupSuccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/TooLarge'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/AuditUnavailable'
+    get:
+      tags: [Intelligence]
+      summary: Look up full intelligence using a query parameter
+      operationId: getLookup
+      parameters:
+        - name: ip
+          in: query
+          required: true
+          description: Public IPv4 or IPv6 address to resolve.
+          schema:
+            type: string
+          example: 8.8.8.8
+      responses:
+        '200':
+          $ref: '#/components/responses/LookupSuccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/AuditUnavailable'
+  /v1/me:
+    get:
+      tags: [Intelligence]
+      summary: Look up the authenticated caller's observed public IP
+      operationId: getMe
+      description: |
+        Uses the client address observed through the intended Cloudflare Tunnel
+        trust boundary. The origin must not be directly exposed to untrusted
+        clients while forwarded address metadata is trusted.
+      responses:
+        '200':
+          $ref: '#/components/responses/LookupSuccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/AuditUnavailable'
+  /v1/country:
+    post:
+      tags: [Compatibility]
+      summary: Return only the country name for an IP address
+      operationId: postCountry
+      description: Backward-compatible minimal endpoint. New integrations should prefer `/v1/lookup`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LookupRequest'
+      responses:
+        '200':
+          description: Country resolved.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/RequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CountryResponse'
+              example:
+                country: United States
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/TooLarge'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/AuditUnavailable'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: key-id.secret
+      description: GeoTagger machine credential in `<key-id>.<secret>` form.
+  headers:
+    RequestID:
+      description: Server-generated request/audit correlation identifier.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{32}$'
+  schemas:
+    LookupRequest:
+      type: object
+      additionalProperties: false
+      required: [ip]
+      properties:
+        ip:
+          type: string
+          description: Public IPv4 or IPv6 address.
+          examples: [8.8.8.8, '2001:4860:4860::8888']
+    CodeName:
+      type: object
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+    Location:
+      type: object
+      additionalProperties: false
+      properties:
+        latitude:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+        longitude:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+        accuracy_radius_km:
+          type: integer
+          minimum: 0
+          description: Approximate uncertainty radius supplied by the GeoLite2 City record.
+        timezone:
+          type: string
+    ASN:
+      type: object
+      additionalProperties: false
+      properties:
+        number:
+          type: integer
+          minimum: 0
+        organization:
+          type: string
+    Classification:
+      type: object
+      additionalProperties: false
+      required: [public, private, loopback, link_local, ip_version]
+      properties:
+        public:
+          type: boolean
+        private:
+          type: boolean
+        loopback:
+          type: boolean
+        link_local:
+          type: boolean
+        ip_version:
+          type: string
+          enum: [IPv4, IPv6]
+    SourceMetadata:
+      type: object
+      additionalProperties: false
+      properties:
+        city_database:
+          type: string
+          description: City MMDB type/build metadata used for this lookup.
+        asn_database:
+          type: string
+          description: ASN MMDB type/build metadata used for this lookup.
+    LookupResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - ip
+        - continent
+        - country
+        - region
+        - location
+        - asn
+        - classification
+        - source
+        - lookup_latency_us
+        - request_id
+      properties:
+        ip:
+          type: string
+        network:
+          type: string
+          description: Matched MMDB network prefix/CIDR when available.
+        continent:
+          $ref: '#/components/schemas/CodeName'
+        country:
+          $ref: '#/components/schemas/CodeName'
+        region:
+          $ref: '#/components/schemas/CodeName'
+        city:
+          type: string
+        postal_code:
+          type: string
+        location:
+          $ref: '#/components/schemas/Location'
+        asn:
+          $ref: '#/components/schemas/ASN'
+        classification:
+          $ref: '#/components/schemas/Classification'
+        source:
+          $ref: '#/components/schemas/SourceMetadata'
+        lookup_latency_us:
+          type: integer
+          minimum: 0
+        request_id:
+          type: string
+          pattern: '^[0-9a-f]{32}$'
+    CountryResponse:
+      type: object
+      additionalProperties: false
+      required: [country]
+      properties:
+        country:
+          type: string
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: string
+  responses:
+    LookupSuccess:
+      description: IP intelligence resolved.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+        Cache-Control:
+          description: Responses are not intended for intermediary caching by default.
+          schema:
+            type: string
+            example: no-store
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/LookupResponse'
+    BadRequest:
+      description: Invalid request body/query shape or caller address unavailable.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+        WWW-Authenticate:
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooLarge:
+      description: Request body exceeds the configured limit.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unprocessable:
+      description: Invalid IP syntax or an address disallowed by the public-address policy.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: The installed GeoLite2 snapshot has no usable result for the valid public IP.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: Local MMDB lookup failed.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    AuditUnavailable:
+      description: Required durable audit transport could not acknowledge the event.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/RequestID'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
