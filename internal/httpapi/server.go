@@ -297,7 +297,7 @@ func (s *Server) performLookup(w http.ResponseWriter, r *http.Request, caller st
 		return geo.Result{}, latencyUS, false
 	}
 	if !found {
-		if !s.publishAudit(r.Context(), caller, ip, geo.Result{}, "not_found", http.StatusNotFound, latencyUS) {
+		if !s.publishAudit(r.Context(), caller, ip, result, "not_found", http.StatusNotFound, latencyUS) {
 			writeError(w, http.StatusServiceUnavailable, "audit transport unavailable")
 			return geo.Result{}, latencyUS, false
 		}
@@ -385,7 +385,7 @@ func (s *Server) publishAudit(parent context.Context, caller string, ip netip.Ad
 	event := audit.Event{
 		Timestamp: time.Now().UTC(), RequestID: requestIDFromContext(parent), CallerID: caller,
 		IPMode: s.auditIPMode, CountryCode: result.CountryCode, Country: result.Country,
-		Outcome: outcome, StatusCode: uint16(status), LookupLatencyUS: latencyUS, MMDBVersion: s.lookup.Version(),
+		Outcome: outcome, StatusCode: uint16(status), LookupLatencyUS: latencyUS, MMDBVersion: s.auditMMDBVersion(result),
 	}
 	if ip.IsValid() {
 		event.IPValue = audit.IPValue(s.auditIPMode, s.auditHMACKey, ip)
@@ -398,6 +398,15 @@ func (s *Server) publishAudit(parent context.Context, caller string, ip netip.Ad
 		return false
 	}
 	return true
+}
+
+func (s *Server) auditMMDBVersion(result geo.Result) string {
+	city := strings.TrimSpace(result.CityDatabaseVersion)
+	asn := strings.TrimSpace(result.ASNDatabaseVersion)
+	if city == "" && asn == "" {
+		return s.lookup.Version()
+	}
+	return "city=" + city + ";asn=" + asn
 }
 
 func publicTarget(ip netip.Addr) bool {
