@@ -7,7 +7,8 @@ This directory is the technical and operational handoff for the deployed GeoTagg
 - [Client Quickstart](CLIENT_QUICKSTART.md) — Yaak and cURL setup, authentication header, test addresses and end-to-end audit verification.
 - [`openapi.yaml`](../openapi.yaml) — machine-readable OpenAPI 3.1 contract suitable for importing into Yaak, Postman and other API clients.
 - [City + ASN Upgrade Runbook](UPGRADE_CITY_ASN.md) — production migration, verification, rollback and post-upgrade benchmark procedure for an existing country-only deployment.
-- [Admin Control Plane](ADMIN_CONTROL_PLANE.md) — pre-implementation security/operational contract for Cloudflare Access, managed API-key lifecycle, one-time token handling and the dedicated admin hostname.
+- [Admin Control Plane](ADMIN_CONTROL_PLANE.md) — implemented human-admin architecture, Cloudflare Access origin validation, managed API-key lifecycle, one-time token handling and failure semantics.
+- [Cloudflare Admin Setup](CLOUDFLARE_ADMIN_SETUP.md) — exact Access application, MFA, AUD/team-domain, Tunnel route, Kubernetes-secret and acceptance-test rollout sequence for `admin.geo.itsjosiahdavis.dev`.
 - [Project Overview](PROJECT_OVERVIEW.md) — purpose, design goals, component responsibilities, trust boundaries, request lifecycle, scaling and operational acceptance.
 - [Production Architecture](ARCHITECTURE.md) — physical placement, Cloudflare ingress, Kubernetes topology, synchronous lookup, durable audit pipeline, storage, networking, scaling and failure recovery.
 - [Kubernetes / K3s Guide](KUBERNETES.md) — Pods versus containers, containerd, Deployments, StatefulSets, Services, HPA, PVCs, probes, CronJobs, NetworkPolicy, Secrets and operating commands.
@@ -31,7 +32,7 @@ flowchart LR
     WORKER --> CH["ClickHouse"]
 ```
 
-The public API now supports:
+The public API supports:
 
 ```text
 POST /v1/lookup       full City + ASN intelligence
@@ -41,6 +42,24 @@ POST /v1/country      backward-compatible country-only response
 ```
 
 The City and ASN databases are downloaded locally with the existing MaxMind license key, verified before activation, memory-mapped by API Pods and hot-reloaded after scheduled refreshes. Normal lookups still do not call a third-party geolocation API.
+
+## Admin/key-management path
+
+The human admin surface is separate from the public machine API:
+
+```mermaid
+flowchart LR
+    HUMAN["Named administrator"] --> ACCESS["Cloudflare Access + MFA"]
+    ACCESS --> CFD["cloudflared"]
+    CFD --> ADMIN["geotagger-admin :9090"]
+    ADMIN --> UI["Admin UI/API"]
+    UI --> KV["NATS KV managed-key store"]
+    KV --> CACHE["in-memory verifier in each API Pod"]
+```
+
+The dashboard manages only JetStream-KV-backed credentials. Existing static `API_KEYS` credentials remain compatibility/break-glass credentials and are intentionally not displayed in the web UI. Managed-key create/rotate operations return plaintext secrets exactly once; GeoTagger stores only SHA-256 digests.
+
+The admin hostname must be protected by Cloudflare Access, and GeoTagger independently validates the Access JWT at the origin. The public machine API hostname must remain free of interactive Access login requirements.
 
 The deployed cluster is a single K3s node inside a dedicated Proxmox VM. Kubernetes provides workload reconciliation, readiness-aware routing, API autoscaling, scheduled MMDB updates, internal service discovery, persistent volumes and network policy. It does not provide hardware high availability for the single VM/host.
 

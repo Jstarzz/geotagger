@@ -6,32 +6,37 @@ This is a repository and architecture review of the current GeoTagger implementa
 
 Reviewed areas:
 
-- API authentication and request validation;
+- machine API authentication and request validation;
+- managed API-key lifecycle and the human admin control plane;
+- Cloudflare Access origin validation;
 - City/ASN enrichment and `/v1/me` trust boundaries;
 - audit privacy and durability;
 - Kubernetes workload security;
 - service/network exposure;
 - secrets and credential handling;
 - NATS/ClickHouse deployment;
-- Cloudflare Tunnel ingress;
 - availability/recovery design; and
 - readiness for use in a regulated healthcare workflow.
 
 ## Summary
 
-No critical authentication-bypass or remote-code-execution issue was identified in this repository-level review. The machine API has useful controls: per-caller secrets stored as digests, strict input handling, public-address filtering, HMAC-based IP audit storage, durable JetStream acceptance, internal-only stateful services, non-root containers and default-deny ingress.
+No critical authentication-bypass or remote-code-execution issue was identified in this repository-level review. The machine API has useful controls: per-caller secrets stored as digests, constant-time verification, strict input handling, public-address filtering, HMAC-based IP audit storage, durable JetStream acceptance, internal-only stateful services, non-root containers and default-deny ingress.
 
-The City + ASN feature expands the data returned to authenticated clients but does not expand the durable ClickHouse audit schema. Approximate city/coordinate/ASN data therefore remains transient by default.
+The new admin control plane substantially improves the previous static-token lifecycle gap. Managed credentials now support creation, rotation, revocation, expiry and ownership/environment metadata. Their plaintext secrets are returned only once, while digests/metadata are stored in file-backed NATS JetStream KV and propagated to API replicas through an in-memory watch. Static `API_KEYS` remains as a compatibility/break-glass source.
 
-Main production gaps:
+The human admin UI is designed for a dedicated Cloudflare Access-protected hostname and independently validates the signed Access JWT at the origin. The feature is fail-closed until `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` are configured.
+
+The City + ASN feature expands data returned to authenticated clients but does not expand the durable ClickHouse audit schema. Approximate city/coordinate/ASN data therefore remains transient by default.
+
+Main production gaps after this change:
 
 1. pod egress is not default-deny;
-2. API-token lifecycle is external/manual;
-3. some runtime images remain tag-pinned instead of digest-pinned;
-4. ClickHouse SQL privileges should be narrowed further;
-5. backup/restore evidence is not yet part of the deployed control set;
-6. the service remains in one VM/host failure domain;
-7. privileged-human MFA/access governance must be enforced outside the API;
+2. static break-glass token governance still requires an operational rotation/recovery process;
+3. the admin control plane still depends on correct Cloudflare Access/MFA configuration and does not yet write a dedicated immutable admin-action audit stream;
+4. some runtime images remain tag-pinned instead of digest-pinned;
+5. ClickHouse SQL privileges should be narrowed further;
+6. backup/restore evidence is not yet part of the deployed control set;
+7. the service remains in one VM/host failure domain;
 8. `/v1/me` depends on forwarded client-IP metadata from the trusted ingress path; and
 9. HIPAA/BAA/risk-management controls must be completed before ePHI use.
 
@@ -47,11 +52,54 @@ key-id.secret
 
 The server stores only the SHA-256 digest of the secret and uses constant-time comparison. Unknown key IDs still perform comparable hashing work before rejection.
 
-Risk remaining: key expiry, owner, rotation date, revocation workflow and last-use metadata are not modeled in the application. Maintain those in an operational credential inventory or dedicated secret/identity system.
+There are two credential sources:
+
+```text
+static API_KEYS       compatibility / break-glass
+NATS managed-key KV   normal managed lifecycle for new integrations
+```
+
+Managed records support owner/service, environment, created/rotated timestamps, optional expiry, revocation time and revocation reason. Static and managed IDs may not collide.
+
+Last-use/request-volume reporting is not yet persisted in the managed record. Caller activity remains available through the existing audit data keyed by caller ID.
+
+### Human admin authentication
+
+The admin UI/API is served only from the internal `:9090` listener through the dedicated `geotagger-admin` Service.
+
+Expected public chain:
+
+```text
+administrator
+  -> Cloudflare Access policy + MFA
+  -> Cloudflare Tunnel
+  -> cloudflared
+  -> geotagger-admin :9090
+  -> origin Access-JWT validation
+  -> admin handler
+```
+
+GeoTagger validates `Cf-Access-Jwt-Assertion` using the Cloudflare Access account signing keys and checks RS256 signature, issuer, application audience, expiration and not-before claims. A user-controlled email header does not grant access.
+
+If Access configuration is absent, `/admin/...` fails closed. Health/readiness/metrics remain internal operational routes.
+
+### Admin browser protections
+
+Admin responses use `Cache-Control: no-store`, frame denial, restrictive CSP, `nosniff`, no-referrer and restrictive Permissions-Policy headers. The UI contains no third-party scripts/analytics.
+
+Mutations require JSON plus a custom CSRF header and reject cross-site `Sec-Fetch-Site` values. Generated tokens are never placed in URLs.
+
+### Managed secret handling
+
+Managed token creation and rotation generate 32 random bytes at the origin. Only the SHA-256 digest is persisted. The plaintext token is returned once to the authenticated administrator.
+
+If a durable create/rotate succeeds but immediate local verifier refresh fails, the response still returns the otherwise unrecoverable one-time token with an explicit propagation warning instead of losing it behind a generic error.
+
+Administrative application logs contain non-secret metadata such as administrator email, operation, key ID and outcome. They do not contain generated token plaintext or the stored digest.
 
 ### Request validation
 
-The API:
+The machine API:
 
 - limits request-body size;
 - rejects unknown JSON fields;
@@ -87,26 +135,39 @@ At capacity, new required events are rejected and the API fails closed rather th
 
 ### Network exposure
 
-Intended ingress:
+Public machine ingress:
 
 ```text
 Internet
   -> Cloudflare
   -> Cloudflare Tunnel
   -> cloudflared
-  -> API Service :8080
+  -> geotagger Service :8080
 ```
 
-NATS and ClickHouse are ClusterIP-only. Port 9090 is not exposed by the public Service.
+Human admin ingress when enabled:
+
+```text
+Internet
+  -> Cloudflare Access
+  -> Cloudflare Tunnel
+  -> cloudflared
+  -> geotagger-admin Service :9090
+```
+
+NATS and ClickHouse remain ClusterIP-only.
 
 Current namespace ingress relationships:
 
 ```text
 cloudflared -> API        TCP 8080
+cloudflared -> API        TCP 9090
 API         -> NATS       TCP 4222
 worker      -> NATS       TCP 4222
 worker      -> ClickHouse TCP 8123
 ```
+
+Port 9090 is not exposed by the public `geotagger` Service; it is exposed only through the dedicated internal admin Service for the Tunnel route.
 
 ### MMDB integrity/activation
 
@@ -127,6 +188,15 @@ API/worker controls include non-root execution, disabled privilege escalation, r
 
 Runtime credentials are referenced through `geotagger-secrets`. K3s is intended to run with secrets encryption at rest.
 
+The secret now also optionally carries:
+
+```text
+CF_ACCESS_TEAM_DOMAIN
+CF_ACCESS_AUD
+```
+
+These identify the Access issuer/application; they are configuration values rather than machine API plaintext secrets, but they should still be managed through the deployment configuration rather than hard-coded in client code.
+
 Kubernetes Secrets are not a complete secret-management program; production still requires administrator governance, rotation, protected recovery copies and incident procedures.
 
 ## Findings
@@ -142,17 +212,24 @@ Remediation:
 - stage default-deny egress;
 - explicitly permit cluster DNS;
 - allow only required API/worker internal destinations;
+- allow API egress to the Cloudflare Access signing-key endpoint when admin JWT validation is enabled;
 - allow cloudflared to Cloudflare;
 - allow the updater to MaxMind; and
 - validate all flows before enforcement.
 
-### SEC-02 — Caller-token lifecycle is external/manual
+### SEC-02 — Managed caller-token lifecycle exists; static break-glass governance remains external
 
-**Severity: Medium**
+**Severity: Low/Medium residual risk**
 
-`API_KEYS` is a static allowlist and does not track issue date, expiry, owner, last use or revocation reason.
+The prior static-only lifecycle gap has been materially reduced. Managed keys now support creation, rotation, revocation, expiry and metadata in the application.
 
-Remediation: unique key per integration/environment, external credential inventory, rotation/revocation procedure, activity review, and higher-assurance mTLS/workload identity where justified.
+Residual issues:
+
+- static `API_KEYS` credentials remain outside the dashboard and need documented break-glass rotation/recovery ownership;
+- managed records do not currently maintain `last_used_at` or a per-key request counter; and
+- higher-assurance workload identity/mTLS may still be appropriate for selected integrations.
+
+Do not remove the last break-glass credential until a separate recovery design is approved.
 
 ### SEC-03 — Runtime image reproducibility is mixed
 
@@ -174,7 +251,7 @@ Remediation: explicit ingest role, least required privileges, separate schema/ad
 
 **Severity: Medium; higher if ePHI or required audit evidence is stored**
 
-Persistent volumes protect against Pod recreation, not host/storage loss.
+Persistent volumes protect against Pod recreation, not host/storage loss. Managed credential metadata now also depends on the NATS persistent volume, increasing the importance of NATS backup/recovery evidence.
 
 Remediation: approved RPO/RTO, independent backups, protected backup credentials, clean-environment restore tests and retained recovery evidence. See `BACKUP_RECOVERY.md`.
 
@@ -182,15 +259,24 @@ Remediation: approved RPO/RTO, independent backups, protected backup credentials
 
 **Severity: Medium operational risk**
 
-One host/VM contains K3s, API, NATS, worker, ClickHouse and cloudflared. HPA is not hardware HA.
+One host/VM contains K3s, API, NATS, worker, ClickHouse and cloudflared. HPA is not hardware HA. The managed-key KV bucket has one NATS replica because there is only one NATS node.
 
-### SEC-07 — Privileged-human MFA/access governance is external
+### SEC-07 — Privileged-human Access/MFA configuration is an external deployment control
 
 **Severity: Medium; High if administrators can access ePHI or regulated audit data**
 
-The machine API has no interactive human login. Privileged Cloudflare, GitHub, Proxmox, Kubernetes, SSH/VPN/bastion, backup and secret-store access still requires named identities, MFA, least privilege, recovery controls and periodic review.
+The origin now validates Cloudflare Access JWTs, but the repository cannot prove that the deployed Access application has a sufficiently restrictive policy or MFA requirement.
 
-See `MFA_AND_IDENTITY.md`.
+Required deployment controls:
+
+- named administrator identity or approved IdP group;
+- no broad `Everyone` allow policy;
+- MFA enabled for the admin application/policy;
+- short privileged session duration;
+- Access application AUD configured at the origin; and
+- periodic administrator access review.
+
+See `MFA_AND_IDENTITY.md` and `CLOUDFLARE_ADMIN_SETUP.md`.
 
 ### SEC-08 — Compliance requires non-code controls and vendor review
 
@@ -235,37 +321,53 @@ Controls:
 - prohibit describing coordinates as GPS/device location; and
 - require a new data/privacy review before using IP location for high-impact decisions or adding it to durable analytics/audit storage.
 
+### SEC-12 — Admin action evidence is structured-log only
+
+**Severity: Low/Medium; higher if immutable privileged-action evidence is required**
+
+Managed credential mutations write structured non-secret logs, but there is no dedicated append-only admin audit stream/table comparable to the machine lookup audit pipeline.
+
+Current record includes administrator identity from the validated Access token, operation, key ID and outcome. If policy requires durable/tamper-resistant privileged-action evidence, add a separate admin audit stream/sink with an approved retention policy rather than expanding general application logs indefinitely.
+
 ## Release security checklist
 
 ```text
 [ ] no plaintext production secrets committed
-[ ] invalid/missing bearer token -> 401
+[ ] invalid/missing machine bearer token -> 401
 [ ] private target -> 422
 [ ] malformed/oversized request rejected
-[ ] every response has X-Request-ID
+[ ] every machine response has X-Request-ID
 [ ] rich response request_id matches response header
 [ ] rich response identifies City + ASN source builds
 [ ] /v1/me works through intended Cloudflare ingress
 [ ] direct-origin/header spoofing exposure has not been introduced
-[ ] matching audit row reaches ClickHouse
+[ ] matching machine audit row reaches ClickHouse
 [ ] rich city/coordinate/ASN response fields are absent from audit unless explicitly approved
 [ ] raw IP is absent when AUDIT_IP_MODE=hmac
 [ ] authentication-failure audit does not retain target IP
 [ ] API fails closed when required durable audit publication cannot complete
-[ ] NATS/ClickHouse/admin port are not externally exposed
+[ ] managed key create/rotate/revoke/expiry behavior validated
+[ ] static and managed key IDs cannot collide
+[ ] generated managed plaintext secret is absent from NATS/logs/Kubernetes Secrets
+[ ] managed-key watcher healthy on all API replicas
+[ ] geotagger-admin Service is ClusterIP-only
+[ ] Cloudflare Access policy for admin hostname is restricted and MFA-enabled
+[ ] direct admin-origin request without valid Access JWT -> 401
+[ ] admin browser responses include no-store/CSP/frame protections
+[ ] NATS/ClickHouse are not externally exposed
 [ ] NetworkPolicy enforcement active
 [ ] Kubernetes Secrets encryption verified
 [ ] API/worker/NATS run with expected numeric non-root identities
 [ ] capabilities remain dropped
 [ ] read-only rootfs remains enabled where designed
 [ ] active MMDB current symlink points to a complete verified release
-[ ] caller credential inventory/rotation status current
+[ ] static break-glass credential ownership/rotation status current
 [ ] privileged administrator MFA/access review current
-[ ] backup/restore evidence current
+[ ] backup/restore evidence includes managed-key state as applicable
 [ ] incident-response contacts/runbook current
 [ ] data classification and HIPAA gate match the environment
 ```
 
 ## Residual risk
 
-For a controlled internal machine service, the current code and deployment model provide a reasonable security foundation. Regulated production use still requires the unresolved controls to be dispositioned through the organization's formal risk-management process, including evidence for vendor contracts, identity/access, backups, incident response, audit handling, recovery and the intended use of approximate location data.
+For a controlled internal machine service, the current code and deployment model provide a reasonable security foundation and now include an application-managed machine-credential lifecycle. Regulated production use still requires the unresolved controls to be dispositioned through the organization's formal risk-management process, including evidence for Cloudflare Access/MFA configuration, vendor contracts, identity/access review, backups, incident response, audit handling, recovery and the intended use of approximate location data.

@@ -9,21 +9,24 @@ import (
 )
 
 type API struct {
-	HTTPAddr        string
-	AdminAddr       string
-	CityMMDBPath    string
-	ASNMMDBPath     string
-	MMDBReload      time.Duration
-	APIKeys         string
-	NATSURL         string
-	AuditStream     string
-	AuditSubject    string
-	AuditTimeout    time.Duration
-	AuditIPMode     string
-	AuditHMACKey    string
-	MaxBodyBytes    int64
-	ShutdownTimeout time.Duration
-	AllowPrivateIPs bool
+	HTTPAddr            string
+	AdminAddr           string
+	CityMMDBPath        string
+	ASNMMDBPath         string
+	MMDBReload          time.Duration
+	APIKeys             string
+	ManagedKeyBucket    string
+	NATSURL             string
+	AuditStream         string
+	AuditSubject        string
+	AuditTimeout        time.Duration
+	AuditIPMode         string
+	AuditHMACKey        string
+	MaxBodyBytes        int64
+	ShutdownTimeout     time.Duration
+	AllowPrivateIPs     bool
+	CFAccessTeamDomain  string
+	CFAccessAudience    string
 }
 
 type Worker struct {
@@ -41,18 +44,21 @@ type Worker struct {
 
 func LoadAPI() (API, error) {
 	c := API{
-		HTTPAddr:        getenv("HTTP_ADDR", ":8080"),
-		AdminAddr:       getenv("ADMIN_ADDR", ":9090"),
-		CityMMDBPath:    getenv("CITY_MMDB_PATH", "/data/current/GeoLite2-City.mmdb"),
-		ASNMMDBPath:     getenv("ASN_MMDB_PATH", "/data/current/GeoLite2-ASN.mmdb"),
-		APIKeys:         os.Getenv("API_KEYS"),
-		NATSURL:         getenv("NATS_URL", "nats://nats:4222"),
-		AuditStream:     getenv("AUDIT_STREAM", "GEOTAGGER_AUDIT"),
-		AuditSubject:    getenv("AUDIT_SUBJECT", "geotagger.audit.lookup"),
-		AuditIPMode:     getenv("AUDIT_IP_MODE", "hmac"),
-		AuditHMACKey:    os.Getenv("AUDIT_HMAC_KEY"),
-		MaxBodyBytes:    1024,
-		AllowPrivateIPs: false,
+		HTTPAddr:           getenv("HTTP_ADDR", ":8080"),
+		AdminAddr:          getenv("ADMIN_ADDR", ":9090"),
+		CityMMDBPath:       getenv("CITY_MMDB_PATH", "/data/current/GeoLite2-City.mmdb"),
+		ASNMMDBPath:        getenv("ASN_MMDB_PATH", "/data/current/GeoLite2-ASN.mmdb"),
+		APIKeys:            os.Getenv("API_KEYS"),
+		ManagedKeyBucket:   getenv("MANAGED_KEY_BUCKET", "GEOTAGGER_API_KEYS"),
+		NATSURL:            getenv("NATS_URL", "nats://nats:4222"),
+		AuditStream:        getenv("AUDIT_STREAM", "GEOTAGGER_AUDIT"),
+		AuditSubject:       getenv("AUDIT_SUBJECT", "geotagger.audit.lookup"),
+		AuditIPMode:        getenv("AUDIT_IP_MODE", "hmac"),
+		AuditHMACKey:       os.Getenv("AUDIT_HMAC_KEY"),
+		MaxBodyBytes:       1024,
+		AllowPrivateIPs:    false,
+		CFAccessTeamDomain: os.Getenv("CF_ACCESS_TEAM_DOMAIN"),
+		CFAccessAudience:   os.Getenv("CF_ACCESS_AUD"),
 	}
 	var err error
 	if c.MMDBReload, err = duration("MMDB_RELOAD_INTERVAL", 5*time.Minute); err != nil {
@@ -74,6 +80,9 @@ func LoadAPI() (API, error) {
 	if c.APIKeys == "" {
 		return API{}, errors.New("API_KEYS is required")
 	}
+	if c.ManagedKeyBucket == "" {
+		return API{}, errors.New("MANAGED_KEY_BUCKET must be non-empty")
+	}
 	if c.CityMMDBPath == "" || c.ASNMMDBPath == "" {
 		return API{}, errors.New("CITY_MMDB_PATH and ASN_MMDB_PATH must be non-empty")
 	}
@@ -88,6 +97,9 @@ func LoadAPI() (API, error) {
 	}
 	if c.AuditTimeout <= 0 {
 		return API{}, errors.New("AUDIT_TIMEOUT must be positive")
+	}
+	if (c.CFAccessTeamDomain == "") != (c.CFAccessAudience == "") {
+		return API{}, errors.New("CF_ACCESS_TEAM_DOMAIN and CF_ACCESS_AUD must be configured together")
 	}
 	return c, nil
 }
